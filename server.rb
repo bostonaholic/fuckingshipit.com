@@ -6,6 +6,8 @@ require "haml"
 require "config"
 require "helpers"
 
+require "newrelic_rpm"
+
 get "/" do
   haml :welcome
 end
