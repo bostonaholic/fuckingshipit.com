@@ -13,7 +13,7 @@
 
 #footer
   - if production?
-    %a{:href => "https://twitter.com/intent/tweet?button_hashtag=fuckingshipit", :class => "twitter-hashtag-button", "data-url" => "http://fuckingshipit.com", "data-dnt" => "true", onClick => "_gaq.push(['_trackEvent', 'Links', 'Click', 'Tweet #fuckingshipit']);"} Tweet #fuckingshipit
+    %a{:href => "https://twitter.com/intent/tweet?button_hashtag=fuckingshipit", :class => "twitter-hashtag-button", "data-url" => "http://fuckingshipit.com", "data-dnt" => "true", "onClick" => "_gaq.push(['_trackEvent', 'Links', 'Click', 'Tweet #fuckingshipit']);"} Tweet #fuckingshipit
   - else
     %a{:href => "https://twitter.com/intent/tweet?button_hashtag=fuckingshipit", :class => "twitter-hashtag-button", "data-url" => "http://fuckingshipit.com", "data-dnt" => "true"} Tweet #fuckingshipit
 
