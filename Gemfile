@@ -7,6 +7,5 @@ gem "thin"
 gem "haml"
 
 group :production do
-  gem "google-analytics"
   gem "newrelic_rpm"
 end
