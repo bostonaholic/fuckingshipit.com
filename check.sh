@@ -140,8 +140,15 @@ slice_1() { # index.html — the static page, verifiable locally
 
   # The h1 and #footer rules, fixed strings verbatim from the original
   # stylesheet (including its double-space alignment in the h1 rule).
-  assert_present "$HTML" 'font-family : "Helvetica";' 'h1 rule sets Helvetica'
+  assert_present "$HTML" 'font-family : "Helvetica";' 'the page sets Helvetica'
   assert_present "$HTML" 'text-align  : center;' 'h1 rule centers the heading'
+
+  # font-family must be declared on `body`, not scoped to `h1`. Scoped to h1,
+  # every other element — including the footer link — inherits the user
+  # agent default instead, which renders as Times in Chromium. The original
+  # stylesheet had this gap; the Twitter widget button supplied its own font
+  # and hid it, so removing widgets.js made it visible.
+  assert_order "$HTML" 'body {' 'font-family : "Helvetica";' 'font-family is declared on body so the whole page inherits it'
   assert_present "$HTML" '#footer' 'the #footer CSS rule exists'
   assert_present "$HTML" 'text-align: center;' 'the #footer rule centers the footer'
 
