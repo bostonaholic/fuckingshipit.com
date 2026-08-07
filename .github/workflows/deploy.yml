@@ -34,7 +34,25 @@ jobs:
       - name: Install the gate's dependencies
         run: sudo apt-get update && sudo apt-get install -y tidy jq
 
-      # shellcheck is preinstalled on the runner image.
+      # Pinned, not the preinstalled one. Ubuntu ships shellcheck 0.9.0,
+      # whose SC2317 fires 61 times on check.sh's indirectly-invoked stubs
+      # — a false positive upstream itself replaced with the narrower
+      # SC2329 in 0.10, which those functions already suppress. Left
+      # unpinned, "shellcheck clean" means whatever the runner image
+      # happens to ship that month, and the gate fails on code that is
+      # correct. Pin the version the scripts are written against.
+      - name: Install shellcheck
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSLf "$url" -o /tmp/shellcheck.tar.xz
+          echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
       - name: Lint the shell scripts
         run: shellcheck provision.sh provision-ci.sh deploy.sh check.sh
 
