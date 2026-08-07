@@ -100,6 +100,7 @@ Manual only:
 
 - Rendering at each breakpoint (600/768/992/1200px): heading centered
   and resizing, footer link centered.
-- A real phone — expect the 2em heading; that is the intentional
-  viewport-fix outcome (design decision 2), not a bug.
+- A real phone — expect the 2em heading, not a bug: the viewport meta
+  tag makes phones report their real width, so the `max-width: 600px`
+  rule applies.
 - Apex and `www` over HTTPS after the DNS edits propagate.

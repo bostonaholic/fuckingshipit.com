@@ -16,13 +16,15 @@ fi
 # deploy.env is parsed as data, never executed, so a tampered file
 # cannot run commands or shadow variables this script depends on (PATH,
 # IFS, ...). Only the three expected keys are accepted, each exactly
-# once, with values limited to the characters AWS identifiers use. The
+# once, with values limited to the characters AWS identifiers use — and
+# never starting with a hyphen, so no value can take the shape of a CLI
+# option. The
 # `|| [ -n "$line" ]` keeps a final line with no trailing newline from
 # skipping validation: `read` returns non-zero on it but still fills
 # $line.
 BUCKET='' DISTRIBUTION_ID='' DISTRIBUTION_DOMAIN=''
 while IFS= read -r line || [ -n "$line" ]; do
-  if ! [[ "$line" =~ ^(BUCKET|DISTRIBUTION_ID|DISTRIBUTION_DOMAIN)=([A-Za-z0-9._-]+)$ ]]; then
+  if ! [[ "$line" =~ ^(BUCKET|DISTRIBUTION_ID|DISTRIBUTION_DOMAIN)=([A-Za-z0-9][A-Za-z0-9._-]*)$ ]]; then
     echo "ERROR: deploy.env has a line that is not one of the three expected KEY=value constants: ${line}" >&2
     exit 1
   fi

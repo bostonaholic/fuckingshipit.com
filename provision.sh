@@ -191,23 +191,34 @@ require_setting() { # <setting-name> <live-value> <expected-value>
   fi
 }
 
-# Drift check for the reuse path. The TLS and security-header settings
-# are only ever WRITTEN by the create branch, so a distribution edited in
-# the console — back to TLSv1, or with the headers policy detached —
-# would otherwise survive every re-run silently. Fail loud, naming the
-# drifted setting; an unexpected live config deserves a human decision,
-# not a blind overwrite.
+# Drift check for the reuse path. The TLS, certificate, alias, origin,
+# and security-header settings are only ever WRITTEN by the create
+# branch, so a distribution edited in the console — back to TLSv1, a
+# swapped certificate, a repointed origin, or with the headers policy
+# detached — would otherwise survive every re-run silently. Fail loud,
+# naming the drifted setting; an unexpected live config deserves a human
+# decision, not a blind overwrite.
+#
+# One get-distribution-config call covers every field. The JMESPath `||`
+# fallbacks turn null-or-empty live values (certificate swapped to the
+# CloudFront default, OAC detached) into sentinels instead of vanishing
+# fields that would shift `read`'s word splitting. Aliases are sorted
+# and joined server-side so ordering can never cause a false failure;
+# the expected string is already in sorted order (DOMAIN < WWW).
 verify_distribution_settings() {
-  local expected_headers_id live viewer_policy min_protocol ssl_method headers_id
+  local expected_headers_id live viewer_policy min_protocol ssl_method headers_id cert_arn aliases oac_id
   expected_headers_id=$(managed_response_headers_policy_id)
   live=$(aws cloudfront get-distribution-config --id "$DISTRIBUTION_ID" \
-    --query "DistributionConfig.[DefaultCacheBehavior.ViewerProtocolPolicy, ViewerCertificate.MinimumProtocolVersion, ViewerCertificate.SSLSupportMethod, not_null(DefaultCacheBehavior.ResponseHeadersPolicyId, 'DETACHED')]" \
+    --query "DistributionConfig.[DefaultCacheBehavior.ViewerProtocolPolicy, ViewerCertificate.MinimumProtocolVersion, ViewerCertificate.SSLSupportMethod, not_null(DefaultCacheBehavior.ResponseHeadersPolicyId, 'DETACHED'), ViewerCertificate.ACMCertificateArn || 'MISSING', join(',', sort(not_null(Aliases.Items, \`[]\`))) || 'NONE', Origins.Items[0].OriginAccessControlId || 'DETACHED']" \
     --output text)
-  read -r viewer_policy min_protocol ssl_method headers_id <<<"$live"
+  read -r viewer_policy min_protocol ssl_method headers_id cert_arn aliases oac_id <<<"$live"
   require_setting ViewerProtocolPolicy "$viewer_policy" redirect-to-https
   require_setting MinimumProtocolVersion "$min_protocol" TLSv1.2_2021
   require_setting SSLSupportMethod "$ssl_method" sni-only
   require_setting ResponseHeadersPolicyId "$headers_id" "$expected_headers_id"
+  require_setting ACMCertificateArn "$cert_arn" "$CERT_ARN"
+  require_setting Aliases "$aliases" "${DOMAIN},${WWW}"
+  require_setting OriginAccessControlId "$oac_id" "$OAC_ID"
 }
 
 # Lookup by alias BEFORE any create — aliases are globally unique. The
