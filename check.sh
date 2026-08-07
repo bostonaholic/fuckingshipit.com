@@ -128,9 +128,9 @@ slice_1() { # index.html — the static page, verifiable locally
   # Footer anchor: label carried over; widget attributes dropped.
   # The href uses `hashtags=`, NOT the original `button_hashtag=`. The latter was
   # a parameter of Twitter's widgets.js, which read it client-side to build the
-  # button. With the widget gone, X ignores it and opens an EMPTY composer —
-  # confirmed by hand against the live site. `hashtags=` (comma-separated, no #)
-  # is the documented intent parameter and prefills the hashtag.
+  # button. With the widget gone, X ignores it and opens an EMPTY composer.
+  # `hashtags=` (comma-separated, no #) is the documented intent parameter
+  # and prefills the hashtag.
   assert_present "$HTML" 'https://twitter.com/intent/tweet?hashtags=fuckingshipit' 'footer anchor href prefills the hashtag via hashtags='
   assert_absent "$HTML" 'button_hashtag' 'the widget-only button_hashtag param is gone'
   assert_present "$HTML" 'Tweet #fuckingshipit' 'footer anchor label is "Tweet #fuckingshipit"'
@@ -256,20 +256,34 @@ slice_4() { # deploy.sh — refuses to run without deploy.env
     fail 'deploy.sh refuses without deploy.env (non-zero exit, message names deploy.env)' "exit=$rc, output: ${out:-<none>}"
   fi
 
-  # If a deploy.env is tracked in git, it must satisfy the same three-key rule
-  # deploy.sh enforces. A malformed one shipped once already: a stray test
-  # fixture was committed by a careless `git add -A`, which left `deploy.sh`
-  # broken on a fresh clone while this suite stayed green.
-  if git ls-files --error-unmatch deploy.env >/dev/null 2>&1; then
-    local bad
-    bad=$(git show "HEAD:deploy.env" | grep -vE '^(BUCKET|DISTRIBUTION_ID|DISTRIBUTION_DOMAIN)=[A-Za-z0-9][A-Za-z0-9._-]*$' || true)
-    if [ -z "$bad" ]; then
-      pass 'tracked deploy.env parses under deploy.sh three-key rule'
+  # design.md:92 sanctions committing deploy.env after a successful provision
+  # run, so this validates it rather than forbidding it. It checks the copy
+  # about to ship — on disk or staged in the index — not HEAD's: a malformed
+  # file staged but not yet committed is precisely the case that ships green
+  # and then breaks deploy.sh on a fresh clone. The contract mirrors
+  # deploy.sh's: every line well-formed, all three keys exactly once.
+  if [ -f deploy.env ] || git ls-files --error-unmatch deploy.env >/dev/null 2>&1; then
+    local env_body bad n
+    if [ -f deploy.env ]; then
+      env_body=$(cat deploy.env)
     else
-      fail 'tracked deploy.env parses under deploy.sh three-key rule' "offending line(s): $bad"
+      env_body=$(git cat-file -p ":deploy.env" 2>/dev/null || true)
     fi
+    bad=$(printf '%s\n' "$env_body" | grep -vE '^(BUCKET|DISTRIBUTION_ID|DISTRIBUTION_DOMAIN)=[A-Za-z0-9][A-Za-z0-9._-]*$' || true)
+    if [ -n "$bad" ]; then
+      fail 'deploy.env about to ship satisfies deploy.sh contract' "malformed line(s): $bad"
+      return
+    fi
+    for k in BUCKET DISTRIBUTION_ID DISTRIBUTION_DOMAIN; do
+      n=$(printf '%s\n' "$env_body" | grep -cE "^${k}=" || true)
+      if [ "$n" -ne 1 ]; then
+        fail 'deploy.env about to ship satisfies deploy.sh contract' "$k appears $n times, expected exactly 1"
+        return
+      fi
+    done
+    pass 'deploy.env about to ship satisfies deploy.sh contract'
   else
-    pass 'no deploy.env is tracked in git (nothing to validate)'
+    pass 'no deploy.env on disk or in the index (nothing to validate)'
   fi
 }
 
