@@ -7,7 +7,14 @@
 # wait ISSUED + create the distribution). Every resource has a stable
 # lookup key, so re-runs reuse instead of duplicating.
 #
-# Takes no arguments. Fails fast on an expired AWS session.
+# Reuse is conditional, not automatic. A re-run verifies that each existing
+# bucket, OAC, and distribution still matches the configuration below, and
+# exits non-zero naming the drifted setting when one does not. That halt is
+# the design working, not a bug: an unexpected live config wants a human
+# decision, not a blind overwrite.
+#
+# Takes no arguments. Needs the AWS CLI and jq. Fails fast on an expired
+# AWS session.
 set -euo pipefail
 
 DOMAIN=fuckingshipit.com
@@ -34,6 +41,16 @@ strip_acm_name() {
   printf '%s\n' "$name"
 }
 
+require_tools() {
+  local tool
+  for tool in aws jq; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "ERROR: ${tool} is not installed, and this script cannot run without it." >&2
+      exit 1
+    fi
+  done
+}
+
 require_auth() {
   if ! ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null); then
     echo "ERROR: AWS session is expired or unauthenticated. Run: aws login" >&2
@@ -41,10 +58,51 @@ require_auth() {
   fi
 }
 
+# Read one field out of a captured JSON response. Every drift check below
+# extracts each field with its own call, so a live value containing a tab
+# or a newline cannot shift the value another check reads. Flattening many
+# fields into one `--output text` row and splitting it with `read` has that
+# hole: one value carrying whitespace supplies the tokens for every later
+# field and truncates the row, and the whole check silently passes.
+json_field() { # <json> <jq-filter>
+  jq -r "$2" <<<"$1"
+}
+
+# AWS-derived IDs become CLI option values (--id, --distribution-id), and
+# quoting stops word splitting but not option parsing — a value starting
+# with a hyphen would be read as a flag. Constrain the shape at the lookup,
+# the same discipline deploy.sh applies to the values it reads.
+require_aws_id() { # <name> <value>
+  if ! [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "ERROR: ${1} from AWS has an unexpected shape: '${2}'." >&2
+    exit 1
+  fi
+}
+
+require_acm_arn() { # <name> <value>
+  if ! [[ "$2" =~ ^arn:aws:acm:[A-Za-z0-9._:/-]+$ ]]; then
+    echo "ERROR: ${1} from AWS has an unexpected shape: '${2}'." >&2
+    exit 1
+  fi
+}
+
+# Drift messages print live AWS values, and an ACM ARN embeds the 12-digit
+# account ID. Mask it — the certificate UUID still says which certificate,
+# so the message stays actionable when the output lands in a CI log or a
+# pasted issue.
+redact_account_id() { # <value>
+  printf '%s\n' "${1//:[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]:/:************:}"
+}
+
 verify_bucket_region() {
-  local bucket_region
-  bucket_region=$(aws s3api get-bucket-location --bucket "$BUCKET" \
-    --query "not_null(LocationConstraint, 'us-east-1')" --output text)
+  local live bucket_region
+  live=$(aws s3api get-bucket-location --bucket "$BUCKET" --output json)
+  # GetBucketLocation reports a us-east-1 bucket as LocationConstraint:
+  # null — for that one region the value is the API's default, not a
+  # stored string. Without the fallback every healthy us-east-1 bucket
+  # reads as empty and is rejected against its own region. Do not
+  # "simplify" it away.
+  bucket_region=$(json_field "$live" '.LocationConstraint // "us-east-1"')
   if [ "$bucket_region" != "$REGION" ]; then
     echo "ERROR: bucket ${BUCKET} is in '${bucket_region}', expected '${REGION}'." >&2
     echo "Use a bucket in ${REGION} or change BUCKET; an S3 bucket cannot be moved between regions." >&2
@@ -85,6 +143,7 @@ ensure_certificate() {
     --query "CertificateSummaryList[?contains(not_null(SubjectAlternativeNameSummaries, \`[]\`), '${DOMAIN}') && contains(not_null(SubjectAlternativeNameSummaries, \`[]\`), '${WWW}')] | [0].CertificateArn" \
     --output text)
   if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ]; then
+    require_acm_arn CertificateArn "$CERT_ARN"
     echo "Reusing certificate ${CERT_ARN} (covers ${DOMAIN} and ${WWW})."
     return
   fi
@@ -95,6 +154,7 @@ ensure_certificate() {
     --subject-alternative-names "$WWW" \
     --validation-method DNS \
     --query CertificateArn --output text)
+  require_acm_arn CertificateArn "$CERT_ARN"
 }
 
 # ResourceRecord is briefly absent right after request-certificate;
@@ -174,6 +234,7 @@ ensure_oac() {
     --query "OriginAccessControlList.Items[?Name=='${OAC_NAME}'] | [0].Id" \
     --output text)
   if [ -n "$OAC_ID" ] && [ "$OAC_ID" != "None" ]; then
+    require_aws_id OriginAccessControlId "$OAC_ID"
     verify_oac_settings
     echo "Reusing origin access control ${OAC_NAME} (${OAC_ID})."
     return
@@ -182,6 +243,7 @@ ensure_oac() {
   OAC_ID=$(aws cloudfront create-origin-access-control \
     --origin-access-control-config "Name=${OAC_NAME},OriginAccessControlOriginType=s3,SigningBehavior=always,SigningProtocol=sigv4" \
     --query OriginAccessControl.Id --output text)
+  require_aws_id OriginAccessControlId "$OAC_ID"
 }
 
 managed_response_headers_policy_id() {
@@ -193,12 +255,26 @@ managed_response_headers_policy_id() {
     echo "ERROR: managed response headers policy Managed-SecurityHeadersPolicy not found." >&2
     exit 1
   fi
+  require_aws_id ResponseHeadersPolicyId "$id"
+  printf '%s\n' "$id"
+}
+
+managed_cache_policy_id() {
+  local id
+  id=$(aws cloudfront list-cache-policies --type managed \
+    --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='Managed-CachingOptimized'] | [0].CachePolicy.Id" \
+    --output text)
+  if [ -z "$id" ] || [ "$id" = "None" ]; then
+    echo "ERROR: managed cache policy Managed-CachingOptimized not found." >&2
+    exit 1
+  fi
+  require_aws_id CachePolicyId "$id"
   printf '%s\n' "$id"
 }
 
 require_oac_setting() { # <setting-name> <live-value> <expected-value>
   if [ "$2" != "$3" ]; then
-    echo "ERROR: origin access control ${OAC_NAME} (${OAC_ID}) has drifted: ${1} is '${2}', expected '${3}'." >&2
+    echo "ERROR: origin access control ${OAC_NAME} (${OAC_ID}) has drifted: ${1} is '$(redact_account_id "$2")', expected '$(redact_account_id "$3")'." >&2
     echo "Fix it in the CloudFront console and re-run — this script does not auto-repair a reused OAC." >&2
     exit 1
   fi
@@ -206,58 +282,133 @@ require_oac_setting() { # <setting-name> <live-value> <expected-value>
 
 verify_oac_settings() {
   local live origin_type signing_behavior signing_protocol
-  live=$(aws cloudfront get-origin-access-control --id "$OAC_ID" \
-    --query 'OriginAccessControl.OriginAccessControlConfig.[OriginAccessControlOriginType,SigningBehavior,SigningProtocol]' \
-    --output text)
-  read -r origin_type signing_behavior signing_protocol <<<"$live"
+  live=$(aws cloudfront get-origin-access-control --id "$OAC_ID" --output json)
+
+  origin_type=$(json_field "$live" '.OriginAccessControl.OriginAccessControlConfig.OriginAccessControlOriginType // "MISSING"')
   require_oac_setting OriginAccessControlOriginType "$origin_type" s3
+
+  signing_behavior=$(json_field "$live" '.OriginAccessControl.OriginAccessControlConfig.SigningBehavior // "MISSING"')
   require_oac_setting SigningBehavior "$signing_behavior" always
+
+  signing_protocol=$(json_field "$live" '.OriginAccessControl.OriginAccessControlConfig.SigningProtocol // "MISSING"')
   require_oac_setting SigningProtocol "$signing_protocol" sigv4
 }
 
 require_setting() { # <setting-name> <live-value> <expected-value>
   if [ "$2" != "$3" ]; then
-    echo "ERROR: distribution ${DISTRIBUTION_ID} has drifted: ${1} is '${2}', expected '${3}'." >&2
+    echo "ERROR: distribution ${DISTRIBUTION_ID} has drifted: ${1} is '$(redact_account_id "$2")', expected '$(redact_account_id "$3")'." >&2
     echo "Fix it in the CloudFront console (or delete the distribution) and re-run — this script does not auto-repair live config." >&2
     exit 1
   fi
 }
 
-# Drift check for the reuse path. Availability, the root object, TLS,
-# certificate, aliases, origin path, and security-header settings are only
-# ever WRITTEN by the create branch, so a distribution edited in the console
-# — disabled, back to TLSv1, repointed at another bucket, or with the headers
-# policy detached — would otherwise survive every re-run silently. Fail loud,
-# naming the drifted setting; an unexpected live config deserves a human
-# decision, not a blind overwrite.
+# Drift check for the reuse path. Every setting that shapes what a visitor
+# receives — availability, the root object, TLS, certificate, aliases, the
+# origin and the path CloudFront uses to reach it, caching, compression,
+# error handling, and the security-header policy — is only ever WRITTEN by
+# the create branch. A distribution edited in the console (disabled, back
+# to TLSv1, repointed at another bucket, an extra cache behavior serving
+# the site over plaintext HTTP) would otherwise survive every re-run
+# silently. Fail loud, naming the drifted setting; an unexpected live
+# config deserves a human decision, not a blind overwrite.
 #
-# One get-distribution-config call covers every field. The JMESPath `||`
-# fallbacks turn null-or-empty live values (certificate swapped to the
-# CloudFront default, OAC detached) into sentinels instead of vanishing
-# fields that would shift `read`'s word splitting. Aliases are sorted
-# and joined server-side so ordering can never cause a false failure;
-# the expected string is already in sorted order (DOMAIN < WWW).
+# Deliberately out of scope: CallerReference, Comment, and PriceClass. The
+# create branch writes them too, but none of them changes what a visitor
+# receives, so drift there is not worth halting a deploy over.
+#
+# One get-distribution-config call covers every field, and each check pulls
+# its own value out of that one response (see json_field). The `if . == ""`
+# guards matter because an emptied field is drift, not absence: a detached
+# policy and a cleared certificate both read as empty, and a bare
+# comparison against the expected value would report them as a confusing
+# blank rather than a named sentinel. Aliases and custom error responses
+# are sorted before joining so ordering can never cause a false failure;
+# the expected strings are already in sorted order (DOMAIN < WWW, 403 < 404).
 verify_distribution_settings() {
-  local expected_headers_id live enabled root_object viewer_policy min_protocol ssl_method
-  local headers_id cert_arn aliases origin_count origin_id origin_domain oac_id target_origin_id
+  local live expected_headers_id expected_cache_policy_id
+  local enabled root_object viewer_policy min_protocol ssl_method headers_id cache_policy_id
+  local compress cert_arn aliases custom_errors cache_behavior_count
+  local origin_count origin_id origin_domain origin_path oac_id origin_access_identity
+  local custom_origin target_origin_id
   expected_headers_id=$(managed_response_headers_policy_id)
-  live=$(aws cloudfront get-distribution-config --id "$DISTRIBUTION_ID" \
-    --query "DistributionConfig.[Enabled && 'ENABLED' || 'DISABLED', DefaultRootObject || 'MISSING', DefaultCacheBehavior.ViewerProtocolPolicy, ViewerCertificate.MinimumProtocolVersion, ViewerCertificate.SSLSupportMethod, not_null(DefaultCacheBehavior.ResponseHeadersPolicyId, 'DETACHED'), ViewerCertificate.ACMCertificateArn || 'MISSING', join(',', sort(not_null(Aliases.Items, \`[]\`))) || 'NONE', length(not_null(Origins.Items, \`[]\`)), Origins.Items[0].Id || 'MISSING', Origins.Items[0].DomainName || 'MISSING', Origins.Items[0].OriginAccessControlId || 'DETACHED', DefaultCacheBehavior.TargetOriginId || 'MISSING']" \
-    --output text)
-  read -r enabled root_object viewer_policy min_protocol ssl_method headers_id cert_arn aliases \
-    origin_count origin_id origin_domain oac_id target_origin_id <<<"$live"
+  expected_cache_policy_id=$(managed_cache_policy_id)
+  live=$(aws cloudfront get-distribution-config --id "$DISTRIBUTION_ID" --output json)
+
+  enabled=$(json_field "$live" '.DistributionConfig.Enabled | if . then "ENABLED" else "DISABLED" end')
   require_setting Enabled "$enabled" ENABLED
+
+  root_object=$(json_field "$live" '.DistributionConfig.DefaultRootObject | if . == null or . == "" then "MISSING" else . end')
   require_setting DefaultRootObject "$root_object" index.html
+
+  viewer_policy=$(json_field "$live" '.DistributionConfig.DefaultCacheBehavior.ViewerProtocolPolicy | if . == null or . == "" then "MISSING" else . end')
   require_setting ViewerProtocolPolicy "$viewer_policy" redirect-to-https
+
+  min_protocol=$(json_field "$live" '.DistributionConfig.ViewerCertificate.MinimumProtocolVersion | if . == null or . == "" then "MISSING" else . end')
   require_setting MinimumProtocolVersion "$min_protocol" TLSv1.2_2021
+
+  ssl_method=$(json_field "$live" '.DistributionConfig.ViewerCertificate.SSLSupportMethod | if . == null or . == "" then "MISSING" else . end')
   require_setting SSLSupportMethod "$ssl_method" sni-only
+
+  headers_id=$(json_field "$live" '.DistributionConfig.DefaultCacheBehavior.ResponseHeadersPolicyId | if . == null or . == "" then "DETACHED" else . end')
   require_setting ResponseHeadersPolicyId "$headers_id" "$expected_headers_id"
+
+  cache_policy_id=$(json_field "$live" '.DistributionConfig.DefaultCacheBehavior.CachePolicyId | if . == null or . == "" then "DETACHED" else . end')
+  require_setting CachePolicyId "$cache_policy_id" "$expected_cache_policy_id"
+
+  compress=$(json_field "$live" '.DistributionConfig.DefaultCacheBehavior.Compress | if . then "ENABLED" else "DISABLED" end')
+  require_setting Compress "$compress" ENABLED
+
+  cert_arn=$(json_field "$live" '.DistributionConfig.ViewerCertificate.ACMCertificateArn | if . == null or . == "" then "MISSING" else . end')
   require_setting ACMCertificateArn "$cert_arn" "$CERT_ARN"
+
+  aliases=$(json_field "$live" '.DistributionConfig.Aliases.Items // [] | sort | join(",") | if . == "" then "NONE" else . end')
   require_setting Aliases "$aliases" "${DOMAIN},${WWW}"
+
+  custom_errors=$(json_field "$live" '.DistributionConfig.CustomErrorResponses.Items // [] | sort_by(.ErrorCode) | map("\(.ErrorCode)=\(.ResponsePagePath)|\(.ResponseCode)|\(.ErrorCachingMinTTL)") | join(",") | if . == "" then "NONE" else . end')
+  require_setting CustomErrorResponses "$custom_errors" '403=/index.html|200|300,404=/index.html|200|300'
+
+  # An added behavior is the quiet way around every check above: one entry
+  # matching *.html with allow-all and no headers policy serves this whole
+  # one-page site over plaintext HTTP, and the default behavior this
+  # function inspects stays untouched. The create branch writes none, so
+  # any is drift.
+  cache_behavior_count=$(json_field "$live" '.DistributionConfig.CacheBehaviors.Items // [] | length')
+  require_setting CacheBehaviorCount "$cache_behavior_count" 0
+
+  origin_count=$(json_field "$live" '.DistributionConfig.Origins.Items // [] | length')
   require_setting OriginCount "$origin_count" 1
+
+  origin_id=$(json_field "$live" '.DistributionConfig.Origins.Items[0].Id | if . == null or . == "" then "MISSING" else . end')
   require_setting OriginId "$origin_id" "$ORIGIN_ID"
+
+  origin_domain=$(json_field "$live" '.DistributionConfig.Origins.Items[0].DomainName | if . == null or . == "" then "MISSING" else . end')
   require_setting OriginDomainName "$origin_domain" "${BUCKET}.s3.${REGION}.amazonaws.com"
+
+  # A prefix here silently relocates every request: OriginPath /staging
+  # makes the site fetch staging/index.html, which does not exist, so the
+  # origin 403s and even the CustomErrorResponses fallback misses. The
+  # create branch writes no prefix, so anything but empty is drift.
+  origin_path=$(json_field "$live" '.DistributionConfig.Origins.Items[0].OriginPath | if . == null or . == "" then "NONE" else . end')
+  require_setting OriginPath "$origin_path" NONE
+
+  oac_id=$(json_field "$live" '.DistributionConfig.Origins.Items[0].OriginAccessControlId | if . == null or . == "" then "DETACHED" else . end')
   require_setting OriginAccessControlId "$oac_id" "$OAC_ID"
+
+  # The legacy access path, and the reason the origin's shape is checked at
+  # all: a distribution given an OriginAccessIdentity authenticates to S3
+  # as an OAI principal, which the bucket policy attached below (service
+  # principal, scoped by AWS:SourceArn) denies. Every identity check above
+  # still passes and the site 403s on every request.
+  origin_access_identity=$(json_field "$live" '.DistributionConfig.Origins.Items[0].S3OriginConfig.OriginAccessIdentity | if . == null or . == "" then "NONE" else . end')
+  require_setting OriginAccessIdentity "$origin_access_identity" NONE
+
+  # Converting the origin to a custom (non-S3) origin keeps the domain name
+  # and passes every check above while changing how CloudFront reaches it —
+  # unsigned, over the public S3 endpoint the bucket policy denies.
+  custom_origin=$(json_field "$live" '.DistributionConfig.Origins.Items[0].CustomOriginConfig | if . == null then "ABSENT" else "PRESENT" end')
+  require_setting CustomOriginConfig "$custom_origin" ABSENT
+
+  target_origin_id=$(json_field "$live" '.DistributionConfig.DefaultCacheBehavior.TargetOriginId | if . == null or . == "" then "MISSING" else . end')
   require_setting TargetOriginId "$target_origin_id" "$ORIGIN_ID"
 }
 
@@ -270,6 +421,7 @@ ensure_distribution() {
     --query "DistributionList.Items[?contains(not_null(Aliases.Items, \`[]\`), '${DOMAIN}')] | [0].Id" \
     --output text)
   if [ -n "$DISTRIBUTION_ID" ] && [ "$DISTRIBUTION_ID" != "None" ]; then
+    require_aws_id DistributionId "$DISTRIBUTION_ID"
     DISTRIBUTION_DOMAIN=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" \
       --query Distribution.DomainName --output text)
     verify_distribution_settings
@@ -278,13 +430,7 @@ ensure_distribution() {
   fi
 
   local cache_policy_id response_headers_policy_id config created
-  cache_policy_id=$(aws cloudfront list-cache-policies --type managed \
-    --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='Managed-CachingOptimized'] | [0].CachePolicy.Id" \
-    --output text)
-  if [ -z "$cache_policy_id" ] || [ "$cache_policy_id" = "None" ]; then
-    echo "ERROR: managed cache policy Managed-CachingOptimized not found." >&2
-    exit 1
-  fi
+  cache_policy_id=$(managed_cache_policy_id)
   response_headers_policy_id=$(managed_response_headers_policy_id)
 
   config=$(cat <<EOF
@@ -333,6 +479,7 @@ EOF
     --query 'Distribution.[Id,DomainName]' --output text)
   DISTRIBUTION_ID=$(cut -f1 <<<"$created")
   DISTRIBUTION_DOMAIN=$(cut -f2 <<<"$created")
+  require_aws_id DistributionId "$DISTRIBUTION_ID"
 }
 
 # Overwrite-safe on re-run. Grants only s3:GetObject, and only to this
@@ -381,6 +528,7 @@ main() {
   # check.sh) cd to their own directory before reading it. Inside main,
   # not at file scope, so sourcing stays side-effect-free.
   cd "$(dirname "$0")" || exit 1
+  require_tools
   require_auth
   ensure_bucket
   ensure_certificate
