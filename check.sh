@@ -125,8 +125,14 @@ slice_1() { # index.html — the static page, verifiable locally
   assert_present "$HTML" '#footer' 'the #footer CSS rule exists'
   assert_present "$HTML" 'text-align: center;' 'the #footer rule centers the footer'
 
-  # Footer anchor: href and label carried over; widget attributes dropped.
-  assert_present "$HTML" 'https://twitter.com/intent/tweet?button_hashtag=fuckingshipit' 'footer anchor href is the tweet intent URL'
+  # Footer anchor: label carried over; widget attributes dropped.
+  # The href uses `hashtags=`, NOT the original `button_hashtag=`. The latter was
+  # a parameter of Twitter's widgets.js, which read it client-side to build the
+  # button. With the widget gone, X ignores it and opens an EMPTY composer —
+  # confirmed by hand against the live site. `hashtags=` (comma-separated, no #)
+  # is the documented intent parameter and prefills the hashtag.
+  assert_present "$HTML" 'https://twitter.com/intent/tweet?hashtags=fuckingshipit' 'footer anchor href prefills the hashtag via hashtags='
+  assert_absent "$HTML" 'button_hashtag' 'the widget-only button_hashtag param is gone'
   assert_present "$HTML" 'Tweet #fuckingshipit' 'footer anchor label is "Tweet #fuckingshipit"'
 
   # Zero external requests — nothing that can fetch anything.
@@ -248,6 +254,22 @@ slice_4() { # deploy.sh — refuses to run without deploy.env
     pass 'deploy.sh refuses without deploy.env (non-zero exit, message names deploy.env)'
   else
     fail 'deploy.sh refuses without deploy.env (non-zero exit, message names deploy.env)' "exit=$rc, output: ${out:-<none>}"
+  fi
+
+  # If a deploy.env is tracked in git, it must satisfy the same three-key rule
+  # deploy.sh enforces. A malformed one shipped once already: a stray test
+  # fixture was committed by a careless `git add -A`, which left `deploy.sh`
+  # broken on a fresh clone while this suite stayed green.
+  if git ls-files --error-unmatch deploy.env >/dev/null 2>&1; then
+    local bad
+    bad=$(git show "HEAD:deploy.env" | grep -vE '^(BUCKET|DISTRIBUTION_ID|DISTRIBUTION_DOMAIN)=[A-Za-z0-9][A-Za-z0-9._-]*$' || true)
+    if [ -z "$bad" ]; then
+      pass 'tracked deploy.env parses under deploy.sh three-key rule'
+    else
+      fail 'tracked deploy.env parses under deploy.sh three-key rule' "offending line(s): $bad"
+    fi
+  else
+    pass 'no deploy.env is tracked in git (nothing to validate)'
   fi
 }
 
