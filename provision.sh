@@ -87,23 +87,26 @@ ensure_certificate() {
 
 # ResourceRecord is briefly absent right after request-certificate;
 # printing then would emit an empty Host/Value table. Poll until every
-# DomainValidationOptions entry has one.
-#
-# SC2016 is a false positive here: the backticks in the JMESPath queries
-# are raw-literal syntax (`[]`, `null`), not shell command substitution.
-# Single quotes are REQUIRED — double quotes would make the shell execute
-# them and silently break the poll.
-# shellcheck disable=SC2016
+# DomainValidationOptions entry has one. One describe-certificate call
+# per attempt: both counts must come from the same snapshot, or a record
+# publish landing between two calls would compare mismatched states.
 wait_for_validation_records() {
-  local attempt total missing
+  local attempt counts total missing
   for attempt in $(seq 1 12); do
-    total=$(aws acm describe-certificate --region "$REGION" \
+    # SC2016 is a false positive on this query: the backticks are
+    # JMESPath raw-literal syntax (`[]`, `null`), not shell command
+    # substitution — single quotes keep the shell away from them
+    # (unescaped inside double quotes they WOULD run as command
+    # substitution). not_null guards BOTH counts because
+    # DomainValidationOptions can be absent right after
+    # request-certificate, and length(null) is a query error that would
+    # kill the script mid-poll under set -e.
+    # shellcheck disable=SC2016
+    counts=$(aws acm describe-certificate --region "$REGION" \
       --certificate-arn "$CERT_ARN" \
-      --query 'length(not_null(Certificate.DomainValidationOptions, `[]`))' --output text)
-    missing=$(aws acm describe-certificate --region "$REGION" \
-      --certificate-arn "$CERT_ARN" \
-      --query 'length(Certificate.DomainValidationOptions[?ResourceRecord == `null`])' \
+      --query '[length(not_null(Certificate.DomainValidationOptions, `[]`)), length(not_null(Certificate.DomainValidationOptions, `[]`)[?ResourceRecord == `null`])]' \
       --output text)
+    read -r total missing <<<"$counts"
     if [ "$total" -ge 1 ] && [ "$missing" -eq 0 ]; then
       return 0
     fi
@@ -168,6 +171,45 @@ ensure_oac() {
     --query OriginAccessControl.Id --output text)
 }
 
+managed_response_headers_policy_id() {
+  local id
+  id=$(aws cloudfront list-response-headers-policies --type managed \
+    --query "ResponseHeadersPolicyList.Items[?ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name=='Managed-SecurityHeadersPolicy'] | [0].ResponseHeadersPolicy.Id" \
+    --output text)
+  if [ -z "$id" ] || [ "$id" = "None" ]; then
+    echo "ERROR: managed response headers policy Managed-SecurityHeadersPolicy not found." >&2
+    exit 1
+  fi
+  printf '%s\n' "$id"
+}
+
+require_setting() { # <setting-name> <live-value> <expected-value>
+  if [ "$2" != "$3" ]; then
+    echo "ERROR: distribution ${DISTRIBUTION_ID} has drifted: ${1} is '${2}', expected '${3}'." >&2
+    echo "Fix it in the CloudFront console (or delete the distribution) and re-run — this script does not auto-repair live config." >&2
+    exit 1
+  fi
+}
+
+# Drift check for the reuse path. The TLS and security-header settings
+# are only ever WRITTEN by the create branch, so a distribution edited in
+# the console — back to TLSv1, or with the headers policy detached —
+# would otherwise survive every re-run silently. Fail loud, naming the
+# drifted setting; an unexpected live config deserves a human decision,
+# not a blind overwrite.
+verify_distribution_settings() {
+  local expected_headers_id live viewer_policy min_protocol ssl_method headers_id
+  expected_headers_id=$(managed_response_headers_policy_id)
+  live=$(aws cloudfront get-distribution-config --id "$DISTRIBUTION_ID" \
+    --query "DistributionConfig.[DefaultCacheBehavior.ViewerProtocolPolicy, ViewerCertificate.MinimumProtocolVersion, ViewerCertificate.SSLSupportMethod, not_null(DefaultCacheBehavior.ResponseHeadersPolicyId, 'DETACHED')]" \
+    --output text)
+  read -r viewer_policy min_protocol ssl_method headers_id <<<"$live"
+  require_setting ViewerProtocolPolicy "$viewer_policy" redirect-to-https
+  require_setting MinimumProtocolVersion "$min_protocol" TLSv1.2_2021
+  require_setting SSLSupportMethod "$ssl_method" sni-only
+  require_setting ResponseHeadersPolicyId "$headers_id" "$expected_headers_id"
+}
+
 # Lookup by alias BEFORE any create — aliases are globally unique. The
 # stable CallerReference is the fail-loud backstop: if the lookup ever
 # misses an existing distribution, create-distribution errors instead of
@@ -179,6 +221,7 @@ ensure_distribution() {
   if [ -n "$DISTRIBUTION_ID" ] && [ "$DISTRIBUTION_ID" != "None" ]; then
     DISTRIBUTION_DOMAIN=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" \
       --query Distribution.DomainName --output text)
+    verify_distribution_settings
     echo "Reusing distribution ${DISTRIBUTION_ID} (${DISTRIBUTION_DOMAIN})."
     return
   fi
@@ -191,13 +234,7 @@ ensure_distribution() {
     echo "ERROR: managed cache policy Managed-CachingOptimized not found." >&2
     exit 1
   fi
-  response_headers_policy_id=$(aws cloudfront list-response-headers-policies --type managed \
-    --query "ResponseHeadersPolicyList.Items[?ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name=='Managed-SecurityHeadersPolicy'] | [0].ResponseHeadersPolicy.Id" \
-    --output text)
-  if [ -z "$response_headers_policy_id" ] || [ "$response_headers_policy_id" = "None" ]; then
-    echo "ERROR: managed response headers policy Managed-SecurityHeadersPolicy not found." >&2
-    exit 1
-  fi
+  response_headers_policy_id=$(managed_response_headers_policy_id)
 
   config=$(cat <<EOF
 {

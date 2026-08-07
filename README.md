@@ -10,7 +10,10 @@ server, no runtime, nothing to patch. The repo's files:
 - `provision.sh` — one-time AWS setup (bucket, ACM cert, CloudFront)
 - `deploy.sh` — repeatable upload + edge cache invalidation
 - `deploy.env` — IDs written by `provision.sh` (appears after the first
-  provision run), read by `deploy.sh`
+  provision run), read by `deploy.sh`. Must stay exactly the three plain
+  `KEY=value` lines `provision.sh` writes — no comments, no quotes, no
+  extra lines — because `deploy.sh` rejects anything else. If a hand-edit
+  breaks it, re-run `./provision.sh` to regenerate it
 - `README.md` — this runbook
 
 ## Prerequisites
@@ -86,6 +89,10 @@ the repo root first, or the curls below hit an empty hostname:
   `https://` location.
 - `curl -sI "https://$DISTRIBUTION_DOMAIN/"` shows
   `cache-control: public, max-age=300`.
+- `curl -sI "https://$DISTRIBUTION_DOMAIN/"` shows
+  `strict-transport-security` (plus `x-content-type-options` and
+  `x-frame-options`) — proof the managed security headers policy is
+  attached.
 - `curl -s "https://fuckingshipit-com.s3.us-east-1.amazonaws.com/index.html"`
   returns `AccessDenied` (the bucket is private; only CloudFront reads it).
 

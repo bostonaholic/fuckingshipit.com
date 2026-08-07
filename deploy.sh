@@ -13,17 +13,33 @@ if [ ! -f deploy.env ]; then
   exit 1
 fi
 
-# `source` executes deploy.env as shell, so refuse anything but plain
-# KEY=value constants — a tampered file must not be able to run commands.
-while IFS= read -r line; do
-  if ! [[ "$line" =~ ^[A-Z_]+=[A-Za-z0-9._-]+$ ]]; then
-    echo "ERROR: deploy.env has a line that is not a plain KEY=value constant: ${line}" >&2
+# deploy.env is parsed as data, never executed, so a tampered file
+# cannot run commands or shadow variables this script depends on (PATH,
+# IFS, ...). Only the three expected keys are accepted, each exactly
+# once, with values limited to the characters AWS identifiers use. The
+# `|| [ -n "$line" ]` keeps a final line with no trailing newline from
+# skipping validation: `read` returns non-zero on it but still fills
+# $line.
+BUCKET='' DISTRIBUTION_ID='' DISTRIBUTION_DOMAIN=''
+while IFS= read -r line || [ -n "$line" ]; do
+  if ! [[ "$line" =~ ^(BUCKET|DISTRIBUTION_ID|DISTRIBUTION_DOMAIN)=([A-Za-z0-9._-]+)$ ]]; then
+    echo "ERROR: deploy.env has a line that is not one of the three expected KEY=value constants: ${line}" >&2
     exit 1
   fi
+  key=${BASH_REMATCH[1]}
+  if [ -n "${!key}" ]; then
+    echo "ERROR: deploy.env sets ${key} more than once" >&2
+    exit 1
+  fi
+  printf -v "$key" '%s' "${BASH_REMATCH[2]}"
 done < deploy.env
 
-# shellcheck source=deploy.env disable=SC1091
-source ./deploy.env
+for key in BUCKET DISTRIBUTION_ID DISTRIBUTION_DOMAIN; do
+  if [ -z "${!key}" ]; then
+    echo "ERROR: deploy.env is missing ${key}" >&2
+    exit 1
+  fi
+done
 
 if ! aws sts get-caller-identity >/dev/null 2>&1; then
   echo "ERROR: AWS session is expired or unauthenticated. Run: aws login" >&2

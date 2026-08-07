@@ -138,7 +138,8 @@ slice_1() { # index.html — the static page, verifiable locally
   assert_absent "$HTML" 'url(' 'index.html has no CSS url()'
   assert_absent "$HTML" '<iframe' 'index.html has no <iframe>'
 
-  # Dead Twitter-widget attributes dropped (design decision 10).
+  # Dead Twitter-widget attributes dropped: with the widget script gone
+  # they can never activate, so keeping them would only mislead.
   assert_absent "$HTML" 'twitter-hashtag-button' 'widget class twitter-hashtag-button is gone'
   assert_absent "$HTML" 'data-url' 'widget attribute data-url is gone'
   assert_absent "$HTML" 'data-dnt' 'widget attribute data-dnt is gone'
@@ -234,9 +235,9 @@ slice_4() { # deploy.sh — refuses to run without deploy.env
   fi
 
   # Run deploy.sh in a scratch dir that has no deploy.env, so this stays
-  # true even after slice 5 commits deploy.env to the repo root. It must
-  # refuse — non-zero exit and a message naming deploy.env — before any
-  # AWS call.
+  # true even once provisioning has written deploy.env to the repo root.
+  # It must refuse — non-zero exit and a message naming deploy.env —
+  # before any AWS call.
   local tmp out rc
   tmp=$(mktemp -d)
   cp deploy.sh "$tmp/deploy.sh" 2>/dev/null
