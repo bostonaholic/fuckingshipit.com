@@ -14,7 +14,7 @@
 # not reasons to abort. `-u` and `pipefail` still catch script bugs.
 set -u -o pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 PASS=0
 FAIL=0
@@ -105,7 +105,8 @@ slice_1() { # index.html — the static page, verifiable locally
   assert_count "$HTML" '<h1' 1 'index.html has exactly one <h1>'
   assert_present "$HTML" '<h1>fucking ship it</h1>' 'the <h1> text is "fucking ship it"'
 
-  # All five media queries, verbatim, rules and order from research.md:50-64.
+  # All five media queries, verbatim — same rules and order as the
+  # original stylesheet.
   assert_present "$HTML" '@media only screen and (max-width: 600px) { h1 { font-size: 2em; } }' 'media query max-width 600px -> 2em, verbatim'
   assert_present "$HTML" '@media only screen and (min-width: 600px) { h1 { font-size: 5em; } }' 'media query min-width 600px -> 5em, verbatim'
   assert_present "$HTML" '@media only screen and (min-width: 768px) { h1 { font-size: 6em; } }' 'media query min-width 768px -> 6em, verbatim'
@@ -117,8 +118,8 @@ slice_1() { # index.html — the static page, verifiable locally
   # max-width must come first so 5em wins at the boundary, same as today.
   assert_order "$HTML" '(max-width: 600px)' '(min-width: 600px)' 'max-width:600px rule appears before min-width:600px rule (600px boundary: 5em must win)'
 
-  # The h1 and #footer rules, fixed strings verbatim from research.md:50-64
-  # (including the original double-space alignment in the h1 rule).
+  # The h1 and #footer rules, fixed strings verbatim from the original
+  # stylesheet (including its double-space alignment in the h1 rule).
   assert_present "$HTML" 'font-family : "Helvetica";' 'h1 rule sets Helvetica'
   assert_present "$HTML" 'text-align  : center;' 'h1 rule centers the heading'
   assert_present "$HTML" '#footer' 'the #footer CSS rule exists'
@@ -180,8 +181,8 @@ slice_2() { # the Sinatra app is deleted
   assert_gone lib 'lib/ is deleted'
   assert_gone views 'views/ is deleted'
 
-  # Structure: ".gitignore no longer lists /log/ or .bundle". The plan
-  # resolves this as whole-file deletion, which also satisfies the check.
+  # .gitignore must not list /log/ or .bundle once the Sinatra app is
+  # gone; deleting the whole file also satisfies that.
   if [ ! -e .gitignore ]; then
     pass '.gitignore no longer lists /log/ or .bundle (file deleted)'
   elif grep -qF -- '/log/' .gitignore || grep -qF -- '.bundle' .gitignore; then
@@ -211,7 +212,7 @@ slice_3() { # provision.sh — correct on paper, no AWS access needed
   fi
 
   # DO NOT "simplify" these two assertions away. They encode the
-  # trailing-dot bug two review rounds were spent eliminating:
+  # trailing-dot bug:
   # ACM returns ResourceRecord.Name fully qualified WITH a trailing dot
   # ("_abc123.fuckingshipit.com."), so stripping ".fuckingshipit.com"
   # alone does not match — the suffix is not at the end of the string.

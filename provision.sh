@@ -45,17 +45,22 @@ ensure_bucket() {
   local err
   if err=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
     echo "Bucket ${BUCKET} already exists — reusing."
-    return
-  fi
-  if [[ "$err" == *"403"* ]]; then
+  elif [[ "$err" == *"403"* ]]; then
     echo "ERROR: head-bucket returned 403 for ${BUCKET}." >&2
     echo "A 403 means the bucket name exists in ANOTHER AWS account (bucket names are global), not that it is absent." >&2
     echo "Pick a different BUCKET constant; this script does not auto-rename." >&2
     exit 1
+  else
+    echo "Creating bucket ${BUCKET} in ${REGION}..."
+    # us-east-1 takes no LocationConstraint.
+    aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null
   fi
-  echo "Creating bucket ${BUCKET} in ${REGION}..."
-  # us-east-1 takes no LocationConstraint.
-  aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null
+  # Enforce Block Public Access on the reuse path too: an adopted bucket
+  # created before April 2023 can have BPA off. Full BPA does not block
+  # the OAC bucket policy — a service principal scoped by AWS:SourceArn
+  # is not "public" to S3.
+  aws s3api put-public-access-block --bucket "$BUCKET" \
+    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 }
 
 # Reuse a certificate only when it covers BOTH names: matching DomainName
@@ -65,7 +70,7 @@ ensure_bucket() {
 ensure_certificate() {
   CERT_ARN=$(aws acm list-certificates --region "$REGION" \
     --certificate-statuses ISSUED PENDING_VALIDATION \
-    --query "CertificateSummaryList[?contains(SubjectAlternativeNameSummaries, '${DOMAIN}') && contains(SubjectAlternativeNameSummaries, '${WWW}')] | [0].CertificateArn" \
+    --query "CertificateSummaryList[?contains(not_null(SubjectAlternativeNameSummaries, \`[]\`), '${DOMAIN}') && contains(not_null(SubjectAlternativeNameSummaries, \`[]\`), '${WWW}')] | [0].CertificateArn" \
     --output text)
   if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ]; then
     echo "Reusing certificate ${CERT_ARN} (covers ${DOMAIN} and ${WWW})."
@@ -83,12 +88,18 @@ ensure_certificate() {
 # ResourceRecord is briefly absent right after request-certificate;
 # printing then would emit an empty Host/Value table. Poll until every
 # DomainValidationOptions entry has one.
+#
+# SC2016 is a false positive here: the backticks in the JMESPath queries
+# are raw-literal syntax (`[]`, `null`), not shell command substitution.
+# Single quotes are REQUIRED — double quotes would make the shell execute
+# them and silently break the poll.
+# shellcheck disable=SC2016
 wait_for_validation_records() {
   local attempt total missing
   for attempt in $(seq 1 12); do
     total=$(aws acm describe-certificate --region "$REGION" \
       --certificate-arn "$CERT_ARN" \
-      --query 'length(Certificate.DomainValidationOptions)' --output text)
+      --query 'length(not_null(Certificate.DomainValidationOptions, `[]`))' --output text)
     missing=$(aws acm describe-certificate --region "$REGION" \
       --certificate-arn "$CERT_ARN" \
       --query 'length(Certificate.DomainValidationOptions[?ResourceRecord == `null`])' \
@@ -163,7 +174,7 @@ ensure_oac() {
 # minting a duplicate.
 ensure_distribution() {
   DISTRIBUTION_ID=$(aws cloudfront list-distributions \
-    --query "DistributionList.Items[?contains(Aliases.Items, '${DOMAIN}')] | [0].Id" \
+    --query "DistributionList.Items[?contains(not_null(Aliases.Items, \`[]\`), '${DOMAIN}')] | [0].Id" \
     --output text)
   if [ -n "$DISTRIBUTION_ID" ] && [ "$DISTRIBUTION_ID" != "None" ]; then
     DISTRIBUTION_DOMAIN=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" \
@@ -172,12 +183,19 @@ ensure_distribution() {
     return
   fi
 
-  local cache_policy_id config created
+  local cache_policy_id response_headers_policy_id config created
   cache_policy_id=$(aws cloudfront list-cache-policies --type managed \
     --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='Managed-CachingOptimized'] | [0].CachePolicy.Id" \
     --output text)
   if [ -z "$cache_policy_id" ] || [ "$cache_policy_id" = "None" ]; then
     echo "ERROR: managed cache policy Managed-CachingOptimized not found." >&2
+    exit 1
+  fi
+  response_headers_policy_id=$(aws cloudfront list-response-headers-policies --type managed \
+    --query "ResponseHeadersPolicyList.Items[?ResponseHeadersPolicy.ResponseHeadersPolicyConfig.Name=='Managed-SecurityHeadersPolicy'] | [0].ResponseHeadersPolicy.Id" \
+    --output text)
+  if [ -z "$response_headers_policy_id" ] || [ "$response_headers_policy_id" = "None" ]; then
+    echo "ERROR: managed response headers policy Managed-SecurityHeadersPolicy not found." >&2
     exit 1
   fi
 
@@ -203,6 +221,7 @@ ensure_distribution() {
     "TargetOriginId": "${ORIGIN_ID}",
     "ViewerProtocolPolicy": "redirect-to-https",
     "CachePolicyId": "${cache_policy_id}",
+    "ResponseHeadersPolicyId": "${response_headers_policy_id}",
     "Compress": true
   },
   "CustomErrorResponses": {
@@ -270,6 +289,10 @@ EOF
 }
 
 main() {
+  # deploy.env must land next to this script — its consumers (deploy.sh,
+  # check.sh) cd to their own directory before reading it. Inside main,
+  # not at file scope, so sourcing stays side-effect-free.
+  cd "$(dirname "$0")" || exit 1
   require_auth
   ensure_bucket
   ensure_certificate

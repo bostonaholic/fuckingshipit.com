@@ -31,10 +31,19 @@ server, no runtime, nothing to patch. The repo's files:
 4. Re-run `./provision.sh` — reuses the bucket and cert, waits for
    `ISSUED`, creates the OAC and distribution, attaches the bucket
    policy, writes `deploy.env`, and prints the final DNS table.
-5. Wait for the distribution to finish deploying (the `--id` flag is
-   required):
+
+   If validation stays stuck even though you pasted the records, the
+   records are probably wrong, not slow: Namecheap's UI can silently
+   mangle pasted values. Diff the printed Host/Value pairs against what
+   Namecheap actually saved and fix any mismatch — a blind re-run waits
+   on the same broken records.
+5. Load the IDs `provision.sh` wrote, then wait for the distribution to
+   finish deploying. Run this in the repo root — every later command
+   that uses `$DISTRIBUTION_ID` or `$DISTRIBUTION_DOMAIN` needs the
+   `source` first (in each new terminal):
 
    ```
+   source deploy.env
    aws cloudfront wait distribution-deployed --id "$DISTRIBUTION_ID"
    ```
 
@@ -66,7 +75,8 @@ Pre-deploy:
 
 - `./check.sh` exits 0.
 
-Post-deploy, against `$DISTRIBUTION_DOMAIN` (from `deploy.env`):
+Post-deploy, against `$DISTRIBUTION_DOMAIN` — run `source deploy.env` in
+the repo root first, or the curls below hit an empty hostname:
 
 - `curl -s -o /dev/null -w "%{http_code}" "https://$DISTRIBUTION_DOMAIN/"`
   returns `200`, and the body contains `fucking ship it`.

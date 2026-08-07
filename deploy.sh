@@ -13,6 +13,15 @@ if [ ! -f deploy.env ]; then
   exit 1
 fi
 
+# `source` executes deploy.env as shell, so refuse anything but plain
+# KEY=value constants — a tampered file must not be able to run commands.
+while IFS= read -r line; do
+  if ! [[ "$line" =~ ^[A-Z_]+=[A-Za-z0-9._-]+$ ]]; then
+    echo "ERROR: deploy.env has a line that is not a plain KEY=value constant: ${line}" >&2
+    exit 1
+  fi
+done < deploy.env
+
 # shellcheck source=deploy.env disable=SC1091
 source ./deploy.env
 
