@@ -90,6 +90,26 @@ assert_strip() { # <input> <expected> <description>
   fi
 }
 
+# Print every way the deploy.env on stdin violates deploy.sh's contract:
+# each line KEY=value with deploy.sh's exact value pattern, each of the
+# three keys exactly once. No output means the copy is valid. Reads the
+# raw stream (not a $(...) capture) so blank lines — including trailing
+# ones, which deploy.sh rejects — are seen, not silently stripped.
+deploy_env_violations() {
+  awk '
+    !/^(BUCKET|DISTRIBUTION_ID|DISTRIBUTION_DOMAIN)=[A-Za-z0-9][A-Za-z0-9._-]*$/ {
+      printf "malformed line %d: \"%s\"; ", NR, $0; next
+    }
+    { split($0, kv, "="); count[kv[1]]++ }
+    END {
+      n = split("BUCKET DISTRIBUTION_ID DISTRIBUTION_DOMAIN", keys, " ")
+      for (i = 1; i <= n; i++)
+        if (count[keys[i]] != 1)
+          printf "%s appears %d times, expected exactly 1; ", keys[i], count[keys[i]]
+    }
+  '
+}
+
 # ---------------------------------------------------------------------------
 slice_1() { # index.html — the static page, verifiable locally
   echo "--- Slice 1: the static page (index.html) ---"
@@ -256,32 +276,35 @@ slice_4() { # deploy.sh — refuses to run without deploy.env
     fail 'deploy.sh refuses without deploy.env (non-zero exit, message names deploy.env)' "exit=$rc, output: ${out:-<none>}"
   fi
 
-  # design.md:92 sanctions committing deploy.env after a successful provision
-  # run, so this validates it rather than forbidding it. It checks the copy
-  # about to ship — on disk or staged in the index — not HEAD's: a malformed
-  # file staged but not yet committed is precisely the case that ships green
-  # and then breaks deploy.sh on a fresh clone. The contract mirrors
-  # deploy.sh's: every line well-formed, all three keys exactly once.
-  if [ -f deploy.env ] || git ls-files --error-unmatch deploy.env >/dev/null 2>&1; then
-    local env_body bad n
-    if [ -f deploy.env ]; then
-      env_body=$(cat deploy.env)
-    else
-      env_body=$(git cat-file -p ":deploy.env" 2>/dev/null || true)
-    fi
-    bad=$(printf '%s\n' "$env_body" | grep -vE '^(BUCKET|DISTRIBUTION_ID|DISTRIBUTION_DOMAIN)=[A-Za-z0-9][A-Za-z0-9._-]*$' || true)
-    if [ -n "$bad" ]; then
-      fail 'deploy.env about to ship satisfies deploy.sh contract' "malformed line(s): $bad"
+  # deploy.env is meant to be committed once provisioning has run — it is
+  # how deploy.sh gets its IDs on a fresh clone — so a present one is
+  # validated, never forbidden. EVERY copy that could ship is checked:
+  # the working tree AND the staged (index) copy, not HEAD's. A malformed
+  # file staged but not yet committed is precisely the sequence that
+  # ships green and then breaks a fresh clone, and a fixed working tree
+  # can still hide a stale malformed copy in the index. The contract
+  # mirrors deploy.sh's in full (deploy_env_violations): a well-shaped
+  # file missing a key breaks a fresh clone just the same.
+  local env_desc='deploy.env about to ship satisfies deploy.sh contract'
+  local env_checked='' problems
+  if [ -f deploy.env ]; then
+    env_checked=yes
+    problems=$(deploy_env_violations < deploy.env)
+    if [ -n "$problems" ]; then
+      fail "$env_desc" "working tree copy: ${problems%; }"
       return
     fi
-    for k in BUCKET DISTRIBUTION_ID DISTRIBUTION_DOMAIN; do
-      n=$(printf '%s\n' "$env_body" | grep -cE "^${k}=" || true)
-      if [ "$n" -ne 1 ]; then
-        fail 'deploy.env about to ship satisfies deploy.sh contract' "$k appears $n times, expected exactly 1"
-        return
-      fi
-    done
-    pass 'deploy.env about to ship satisfies deploy.sh contract'
+  fi
+  if git cat-file -e :deploy.env 2>/dev/null; then
+    env_checked=yes
+    problems=$(git cat-file -p :deploy.env 2>/dev/null | deploy_env_violations)
+    if [ -n "$problems" ]; then
+      fail "$env_desc" "index copy: ${problems%; }"
+      return
+    fi
+  fi
+  if [ -n "$env_checked" ]; then
+    pass "$env_desc"
   else
     pass 'no deploy.env on disk or in the index (nothing to validate)'
   fi
