@@ -1,0 +1,5 @@
+# Written by provision.sh; regenerate with ./provision.sh rather than committing.
+# Not secret — a bucket name, a distribution id, and a public CloudFront domain —
+# but there is no reason to publish internal resource ids, and an accidentally
+# committed copy breaks deploy.sh on a fresh clone.
+deploy.env
