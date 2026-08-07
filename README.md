@@ -19,6 +19,7 @@ server, no runtime, nothing to patch. The repo's files:
 ## Prerequisites
 
 - AWS CLI v2, authenticated via `aws login`
+- `jq` — `provision.sh` reads every AWS response through it
 - Access to Namecheap DNS for `fuckingshipit.com`
 
 ## Rollout
@@ -40,6 +41,15 @@ server, no runtime, nothing to patch. The repo's files:
    mangle pasted values. Diff the printed Host/Value pairs against what
    Namecheap actually saved and fix any mismatch — a blind re-run waits
    on the same broken records.
+
+   A re-run can also stop on a resource that already exists but no longer
+   matches what the script expects — a bucket in the wrong region, an OAC
+   that stopped signing, a distribution disabled or repointed in the
+   console. That is the expected halt, not a failure: reuse is checked,
+   never assumed. The `ERROR:` line names the exact setting and both
+   values, so fix that one setting in the AWS console and re-run. The
+   script never repairs live config on its own — an unexpected config is
+   a human decision.
 5. Load the IDs `provision.sh` wrote, then wait for the distribution to
    finish deploying. Run this in the repo root — every later command
    that uses `$DISTRIBUTION_ID` or `$DISTRIBUTION_DOMAIN` needs the

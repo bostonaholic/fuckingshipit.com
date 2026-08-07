@@ -110,6 +110,213 @@ deploy_env_violations() {
   '
 }
 
+# AWS stub for the provisioning reuse-path tests below. Each scenario exposes
+# only the calls that function is allowed to make; any unexpected call fails
+# the test instead of accidentally reaching the real account.
+#
+# The three calls the drift checks read are stubbed as the JSON the API
+# actually returns, not as pre-extracted values, so provision.sh's own jq
+# expressions run here. A typo in one of them fails a test instead of
+# waiting to fail against live AWS. The list-* lookups still return their
+# post-query scalar: reproducing them faithfully would mean reimplementing
+# JMESPath filtering in the stub, and no drift check reads them.
+# shellcheck disable=SC2329 # Invoked indirectly by the aws() shim below.
+provision_aws_stub() {
+  local operation="${1:-} ${2:-}"
+  case "$operation" in
+    's3api head-bucket')
+      case "$AWS_STUB_SCENARIO" in
+        bucket_*) return 0 ;;
+      esac
+      ;;
+    's3api get-bucket-location')
+      # us-east-1 is reported as null, not as its name — the case that
+      # makes provision.sh's fallback load-bearing.
+      case "$AWS_STUB_SCENARIO" in
+        bucket_wrong_region) printf '{"LocationConstraint":"us-west-2"}\n'; return 0 ;;
+        bucket_healthy) printf '{"LocationConstraint":null}\n'; return 0 ;;
+      esac
+      ;;
+    's3api put-public-access-block')
+      if [ "$AWS_STUB_SCENARIO" = bucket_healthy ]; then return 0; fi
+      ;;
+    'cloudfront list-origin-access-controls')
+      case "$AWS_STUB_SCENARIO" in
+        oac_*) printf 'EOAC123\n'; return 0 ;;
+      esac
+      ;;
+    'cloudfront get-origin-access-control')
+      case "$AWS_STUB_SCENARIO" in
+        oac_*) provision_oac_stub_json; return 0 ;;
+      esac
+      ;;
+    'cloudfront list-response-headers-policies')
+      case "$AWS_STUB_SCENARIO" in
+        distribution_*) printf 'EHEADERS123\n'; return 0 ;;
+      esac
+      ;;
+    'cloudfront list-cache-policies')
+      case "$AWS_STUB_SCENARIO" in
+        distribution_*) printf 'ECACHE123\n'; return 0 ;;
+      esac
+      ;;
+    'cloudfront get-distribution-config')
+      case "$AWS_STUB_SCENARIO" in
+        distribution_*) provision_distribution_stub_json; return 0 ;;
+      esac
+      ;;
+  esac
+  printf 'unexpected aws call for %s: %s\n' "$AWS_STUB_SCENARIO" "$*" >&2
+  return 99
+}
+
+# shellcheck disable=SC2329 # Invoked indirectly by provision_aws_stub.
+provision_oac_stub_json() {
+  local override='.'
+  case "$AWS_STUB_SCENARIO" in
+    oac_wrong_type) override='.OriginAccessControl.OriginAccessControlConfig.OriginAccessControlOriginType = "mediastore"' ;;
+    oac_wrong_signing) override='.OriginAccessControl.OriginAccessControlConfig.SigningBehavior = "never"' ;;
+    oac_wrong_protocol) override='.OriginAccessControl.OriginAccessControlConfig.SigningProtocol = "sigv2"' ;;
+  esac
+  jq "$override" <<'JSON'
+{
+  "OriginAccessControl": {
+    "Id": "EOAC123",
+    "OriginAccessControlConfig": {
+      "Name": "fuckingshipit-com-oac",
+      "OriginAccessControlOriginType": "s3",
+      "SigningBehavior": "always",
+      "SigningProtocol": "sigv4"
+    }
+  }
+}
+JSON
+}
+
+# Every distribution scenario starts from the config the create branch
+# writes and mutates exactly ONE field, so a failing test names the check
+# that caught it and nothing else. A scenario with no override is the
+# healthy baseline.
+# shellcheck disable=SC2329 # Invoked indirectly by provision_aws_stub.
+provision_distribution_stub_json() {
+  local override='.'
+  case "$AWS_STUB_SCENARIO" in
+    distribution_disabled) override='.DistributionConfig.Enabled = false' ;;
+    distribution_wrong_root_object) override='.DistributionConfig.DefaultRootObject = "home.html"' ;;
+    distribution_plaintext) override='.DistributionConfig.DefaultCacheBehavior.ViewerProtocolPolicy = "allow-all"' ;;
+    distribution_old_tls) override='.DistributionConfig.ViewerCertificate.MinimumProtocolVersion = "TLSv1"' ;;
+    distribution_wrong_ssl_method) override='.DistributionConfig.ViewerCertificate.SSLSupportMethod = "vip"' ;;
+    distribution_headers_detached) override='del(.DistributionConfig.DefaultCacheBehavior.ResponseHeadersPolicyId)' ;;
+    distribution_cache_policy_swapped) override='.DistributionConfig.DefaultCacheBehavior.CachePolicyId = "EOTHERCACHE"' ;;
+    distribution_compress_off) override='.DistributionConfig.DefaultCacheBehavior.Compress = false' ;;
+    distribution_wrong_cert) override='.DistributionConfig.ViewerCertificate.ACMCertificateArn = "arn:aws:acm:us-east-1:210987654321:certificate/other"' ;;
+    distribution_missing_alias) override='.DistributionConfig.Aliases.Items = ["fuckingshipit.com"]' ;;
+    distribution_no_custom_errors) override='.DistributionConfig.CustomErrorResponses.Items = []' ;;
+    distribution_extra_cache_behavior) override='.DistributionConfig.CacheBehaviors = {"Quantity":1,"Items":[{"PathPattern":"*.html","TargetOriginId":"s3-fuckingshipit-com","ViewerProtocolPolicy":"allow-all"}]}' ;;
+    distribution_two_origins) override='.DistributionConfig.Origins.Items += [{"Id":"second","DomainName":"other.example.com"}]' ;;
+    distribution_wrong_origin_id) override='.DistributionConfig.Origins.Items[0].Id = "other-origin-id"' ;;
+    distribution_wrong_origin) override='.DistributionConfig.Origins.Items[0].DomainName = "other-bucket.s3.us-east-1.amazonaws.com"' ;;
+    distribution_origin_path) override='.DistributionConfig.Origins.Items[0].OriginPath = "/staging"' ;;
+    distribution_oac_detached) override='del(.DistributionConfig.Origins.Items[0].OriginAccessControlId)' ;;
+    distribution_legacy_oai) override='.DistributionConfig.Origins.Items[0].S3OriginConfig.OriginAccessIdentity = "origin-access-identity/cloudfront/E2LEGACY"' ;;
+    distribution_custom_origin) override='.DistributionConfig.Origins.Items[0].CustomOriginConfig = {"HTTPPort":80,"OriginProtocolPolicy":"http-only"}' ;;
+    distribution_wrong_target) override='.DistributionConfig.DefaultCacheBehavior.TargetOriginId = "other-origin"' ;;
+    # The value that used to defeat every check at once. Reading the config
+    # as one tab-separated row and splitting it with `read` let a value
+    # carrying a newline truncate the row and hand the later fields their
+    # expected tokens — so the drifted ViewerProtocolPolicy below was never
+    # reached and the whole config passed.
+    distribution_newline_in_value)
+      override='.DistributionConfig.DefaultRootObject = "index.html\nallow-all\tTLSv1.2_2021\tsni-only"
+        | .DistributionConfig.DefaultCacheBehavior.ViewerProtocolPolicy = "allow-all"' ;;
+  esac
+  jq "$override" <<'JSON'
+{
+  "DistributionConfig": {
+    "CallerReference": "fuckingshipit-com-static-site",
+    "Comment": "fuckingshipit.com static site",
+    "Enabled": true,
+    "DefaultRootObject": "index.html",
+    "PriceClass": "PriceClass_100",
+    "Aliases": { "Quantity": 2, "Items": ["fuckingshipit.com", "www.fuckingshipit.com"] },
+    "Origins": {
+      "Quantity": 1,
+      "Items": [
+        {
+          "Id": "s3-fuckingshipit-com",
+          "DomainName": "fuckingshipit-com.s3.us-east-1.amazonaws.com",
+          "OriginPath": "",
+          "OriginAccessControlId": "EOAC123",
+          "S3OriginConfig": { "OriginAccessIdentity": "" }
+        }
+      ]
+    },
+    "DefaultCacheBehavior": {
+      "TargetOriginId": "s3-fuckingshipit-com",
+      "ViewerProtocolPolicy": "redirect-to-https",
+      "CachePolicyId": "ECACHE123",
+      "ResponseHeadersPolicyId": "EHEADERS123",
+      "Compress": true
+    },
+    "CustomErrorResponses": {
+      "Quantity": 2,
+      "Items": [
+        { "ErrorCode": 403, "ResponsePagePath": "/index.html", "ResponseCode": "200", "ErrorCachingMinTTL": 300 },
+        { "ErrorCode": 404, "ResponsePagePath": "/index.html", "ResponseCode": "200", "ErrorCachingMinTTL": 300 }
+      ]
+    },
+    "ViewerCertificate": {
+      "ACMCertificateArn": "arn:aws:acm:us-east-1:123456789012:certificate/test",
+      "SSLSupportMethod": "sni-only",
+      "MinimumProtocolVersion": "TLSv1.2_2021"
+    }
+  }
+}
+JSON
+}
+
+# The IDs a reuse path would have already looked up before the drift check
+# runs. Set for every scenario: each test gets a fresh subshell that
+# re-sources provision.sh, so an unused constant cannot leak into another.
+run_provision_test() { # <scenario> <function-name>
+  local scenario=$1 function_name=$2
+  (
+    AWS_STUB_SCENARIO=$scenario
+    source ./provision.sh
+    # shellcheck disable=SC2329 # Invoked by functions sourced from provision.sh.
+    aws() { provision_aws_stub "$@"; }
+    DISTRIBUTION_ID=EDIST123
+    CERT_ARN=arn:aws:acm:us-east-1:123456789012:certificate/test
+    OAC_ID=EOAC123
+    "$function_name"
+  )
+}
+
+assert_provision_rejects() { # <scenario> <function-name> <message-fragment> <description>
+  local scenario=$1 function_name=$2 needle=$3 desc=$4 out rc
+  out=$(run_provision_test "$scenario" "$function_name" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF -- "$needle" &&
+    ! printf '%s' "$out" | grep -qF 'unexpected aws call'; then
+    pass "$desc"
+  else
+    fail "$desc" "exit=$rc, output: ${out:-<none>}"
+  fi
+}
+
+assert_provision_accepts() { # <scenario> <function-name> <message-fragment> <description>
+  local scenario=$1 function_name=$2 needle=$3 desc=$4 out rc
+  out=$(run_provision_test "$scenario" "$function_name" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -qF 'unexpected aws call'; then
+    if [ -z "$needle" ] || printf '%s' "$out" | grep -qF -- "$needle"; then
+      pass "$desc"
+      return
+    fi
+  fi
+  fail "$desc" "exit=$rc, output: ${out:-<none>}"
+}
+
 # ---------------------------------------------------------------------------
 slice_1() { # index.html — the static page, verifiable locally
   echo "--- Slice 1: the static page (index.html) ---"
@@ -255,6 +462,109 @@ slice_3() { # provision.sh — correct on paper, no AWS access needed
   # at Namecheap and hangs ACM validation for 72 hours with no useful error.
   assert_strip '_abc123.fuckingshipit.com.' '_abc123' 'strip_acm_name: apex validation name (trailing dot) -> _abc123'
   assert_strip '_def456.www.fuckingshipit.com.' '_def456.www' 'strip_acm_name: www validation name (trailing dot) -> _def456.www'
+
+  # provision.sh reads every AWS response through jq, so a missing jq is a
+  # broken deploy, not a test worth skipping.
+  local jq_desc='jq is installed (provision.sh parses AWS responses with it)'
+  if command -v jq >/dev/null 2>&1; then
+    pass "$jq_desc"
+  else
+    fail "$jq_desc" 'not on PATH — install it: brew install jq'
+  fi
+
+  # One rejecting scenario per drift check below. Deleting any single
+  # require_* line from provision.sh must turn a test red; a check with no
+  # scenario is a check that can be removed unnoticed.
+  assert_provision_rejects bucket_wrong_region ensure_bucket \
+    "bucket fuckingshipit-com is in 'us-west-2', expected 'us-east-1'" \
+    'ensure_bucket rejects a reused bucket in the wrong region'
+  # The healthy bucket answers with LocationConstraint: null, the shape
+  # us-east-1 actually returns — so this also covers the normalization.
+  assert_provision_accepts bucket_healthy ensure_bucket 'already exists — reusing' \
+    'ensure_bucket accepts a reused us-east-1 bucket (LocationConstraint: null)'
+
+  assert_provision_rejects oac_wrong_type ensure_oac \
+    "OriginAccessControlOriginType is 'mediastore', expected 's3'" \
+    'ensure_oac rejects a reused OAC that no longer targets S3'
+  assert_provision_rejects oac_wrong_signing ensure_oac \
+    "SigningBehavior is 'never', expected 'always'" \
+    'ensure_oac rejects a reused OAC that no longer signs requests'
+  assert_provision_rejects oac_wrong_protocol ensure_oac \
+    "SigningProtocol is 'sigv2', expected 'sigv4'" \
+    'ensure_oac rejects a reused OAC signing with the wrong protocol'
+  assert_provision_accepts oac_healthy ensure_oac 'Reusing origin access control' \
+    'ensure_oac accepts a compatible reused OAC'
+
+  assert_provision_rejects distribution_disabled verify_distribution_settings \
+    "Enabled is 'DISABLED', expected 'ENABLED'" \
+    'distribution drift check rejects a disabled distribution'
+  assert_provision_rejects distribution_wrong_root_object verify_distribution_settings \
+    "DefaultRootObject is 'home.html', expected 'index.html'" \
+    'distribution drift check rejects a changed root object'
+  assert_provision_rejects distribution_plaintext verify_distribution_settings \
+    "ViewerProtocolPolicy is 'allow-all', expected 'redirect-to-https'" \
+    'distribution drift check rejects plaintext HTTP'
+  assert_provision_rejects distribution_old_tls verify_distribution_settings \
+    "MinimumProtocolVersion is 'TLSv1', expected 'TLSv1.2_2021'" \
+    'distribution drift check rejects a downgraded TLS floor'
+  assert_provision_rejects distribution_wrong_ssl_method verify_distribution_settings \
+    "SSLSupportMethod is 'vip', expected 'sni-only'" \
+    'distribution drift check rejects a changed SSL support method'
+  assert_provision_rejects distribution_headers_detached verify_distribution_settings \
+    "ResponseHeadersPolicyId is 'DETACHED', expected 'EHEADERS123'" \
+    'distribution drift check rejects a detached security-headers policy'
+  assert_provision_rejects distribution_cache_policy_swapped verify_distribution_settings \
+    "CachePolicyId is 'EOTHERCACHE', expected 'ECACHE123'" \
+    'distribution drift check rejects a swapped cache policy'
+  assert_provision_rejects distribution_compress_off verify_distribution_settings \
+    "Compress is 'DISABLED', expected 'ENABLED'" \
+    'distribution drift check rejects compression turned off'
+  # Also the redaction guard: the printed ARN must carry a masked account
+  # ID, so drift output stays safe to paste into a CI log or an issue.
+  assert_provision_rejects distribution_wrong_cert verify_distribution_settings \
+    "ACMCertificateArn is 'arn:aws:acm:us-east-1:************:certificate/other'" \
+    'distribution drift check rejects a swapped certificate, account ID masked'
+  assert_provision_rejects distribution_missing_alias verify_distribution_settings \
+    "Aliases is 'fuckingshipit.com', expected 'fuckingshipit.com,www.fuckingshipit.com'" \
+    'distribution drift check rejects a dropped alias'
+  assert_provision_rejects distribution_no_custom_errors verify_distribution_settings \
+    "CustomErrorResponses is 'NONE'" \
+    'distribution drift check rejects removed custom error responses'
+  assert_provision_rejects distribution_extra_cache_behavior verify_distribution_settings \
+    "CacheBehaviorCount is '1', expected '0'" \
+    'distribution drift check rejects an added cache behavior'
+  assert_provision_rejects distribution_two_origins verify_distribution_settings \
+    "OriginCount is '2', expected '1'" \
+    'distribution drift check rejects a second origin'
+  assert_provision_rejects distribution_wrong_origin_id verify_distribution_settings \
+    "OriginId is 'other-origin-id', expected 's3-fuckingshipit-com'" \
+    'distribution drift check rejects a renamed origin'
+  assert_provision_rejects distribution_wrong_origin verify_distribution_settings \
+    "OriginDomainName is 'other-bucket.s3.us-east-1.amazonaws.com'" \
+    'distribution drift check rejects a repointed origin'
+  assert_provision_rejects distribution_origin_path verify_distribution_settings \
+    "OriginPath is '/staging', expected 'NONE'" \
+    'distribution drift check rejects an origin path prefix'
+  assert_provision_rejects distribution_oac_detached verify_distribution_settings \
+    "OriginAccessControlId is 'DETACHED', expected 'EOAC123'" \
+    'distribution drift check rejects a detached origin access control'
+  assert_provision_rejects distribution_legacy_oai verify_distribution_settings \
+    "OriginAccessIdentity is 'origin-access-identity/cloudfront/E2LEGACY'" \
+    'distribution drift check rejects a legacy origin access identity'
+  assert_provision_rejects distribution_custom_origin verify_distribution_settings \
+    "CustomOriginConfig is 'PRESENT', expected 'ABSENT'" \
+    'distribution drift check rejects an origin converted to a custom origin'
+  assert_provision_rejects distribution_wrong_target verify_distribution_settings \
+    "TargetOriginId is 'other-origin', expected 's3-fuckingshipit-com'" \
+    'distribution drift check rejects a repointed default behavior'
+  # Regression guard for the row-splitting hole: this config is drifted AND
+  # carries a newline in an earlier value. Reading the response as one
+  # tab-separated row accepted it; reading each field on its own rejects it.
+  assert_provision_rejects distribution_newline_in_value verify_distribution_settings \
+    "DefaultRootObject is 'index.html" \
+    'distribution drift check rejects a value carrying a newline'
+  assert_provision_accepts distribution_healthy verify_distribution_settings '' \
+    'distribution drift check accepts the expected serving path'
 }
 
 # ---------------------------------------------------------------------------
