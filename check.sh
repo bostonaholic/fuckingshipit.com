@@ -110,6 +110,107 @@ deploy_env_violations() {
   '
 }
 
+# AWS stub for the provisioning reuse-path tests below. Each scenario exposes
+# only the calls that function is allowed to make; any unexpected call fails
+# the test instead of accidentally reaching the real account.
+# shellcheck disable=SC2329 # Invoked indirectly by the aws() shim below.
+provision_aws_stub() {
+  local operation="${1:-} ${2:-}"
+  case "$operation" in
+    's3api head-bucket')
+      case "$AWS_STUB_SCENARIO" in
+        bucket_*) return 0 ;;
+      esac
+      ;;
+    's3api get-bucket-location')
+      case "$AWS_STUB_SCENARIO" in
+        bucket_wrong_region) printf 'us-west-2\n'; return 0 ;;
+        bucket_healthy) printf 'us-east-1\n'; return 0 ;;
+      esac
+      ;;
+    's3api put-public-access-block')
+      if [ "$AWS_STUB_SCENARIO" = bucket_healthy ]; then return 0; fi
+      ;;
+    'cloudfront list-origin-access-controls')
+      case "$AWS_STUB_SCENARIO" in
+        oac_*) printf 'EOAC123\n'; return 0 ;;
+      esac
+      ;;
+    'cloudfront get-origin-access-control')
+      case "$AWS_STUB_SCENARIO" in
+        oac_wrong_signing) printf 's3\tnever\tsigv4\n'; return 0 ;;
+        oac_healthy) printf 's3\talways\tsigv4\n'; return 0 ;;
+      esac
+      ;;
+    'cloudfront list-response-headers-policies')
+      case "$AWS_STUB_SCENARIO" in
+        distribution_*) printf 'EHEADERS123\n'; return 0 ;;
+      esac
+      ;;
+    'cloudfront get-distribution-config')
+      case "$AWS_STUB_SCENARIO" in
+        distribution_*) provision_distribution_stub_row; return 0 ;;
+      esac
+      ;;
+  esac
+  printf 'unexpected aws call for %s: %s\n' "$AWS_STUB_SCENARIO" "$*" >&2
+  return 99
+}
+
+# shellcheck disable=SC2329 # Invoked indirectly by provision_aws_stub.
+provision_distribution_stub_row() {
+  local enabled=ENABLED origin_domain="${BUCKET}.s3.${REGION}.amazonaws.com" target_origin_id=$ORIGIN_ID
+  case "$AWS_STUB_SCENARIO" in
+    distribution_disabled) enabled=DISABLED ;;
+    distribution_wrong_origin) origin_domain=other-bucket.s3.us-east-1.amazonaws.com ;;
+    distribution_wrong_target) target_origin_id=other-origin ;;
+  esac
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$enabled" index.html redirect-to-https TLSv1.2_2021 sni-only EHEADERS123 \
+    "$CERT_ARN" "${DOMAIN},${WWW}" 1 "$ORIGIN_ID" "$origin_domain" "$OAC_ID" "$target_origin_id"
+}
+
+run_provision_test() { # <scenario> <function-name>
+  local scenario=$1 function_name=$2
+  (
+    AWS_STUB_SCENARIO=$scenario
+    source ./provision.sh
+    # shellcheck disable=SC2329 # Invoked by functions sourced from provision.sh.
+    aws() { provision_aws_stub "$@"; }
+    if [ "$function_name" = verify_distribution_settings ]; then
+      DISTRIBUTION_ID=EDIST123
+      CERT_ARN=arn:aws:acm:us-east-1:123456789012:certificate/test
+      OAC_ID=EOAC123
+    fi
+    "$function_name"
+  )
+}
+
+assert_provision_rejects() { # <scenario> <function-name> <message-fragment> <description>
+  local scenario=$1 function_name=$2 needle=$3 desc=$4 out rc
+  out=$(run_provision_test "$scenario" "$function_name" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF -- "$needle" &&
+    ! printf '%s' "$out" | grep -qF 'unexpected aws call'; then
+    pass "$desc"
+  else
+    fail "$desc" "exit=$rc, output: ${out:-<none>}"
+  fi
+}
+
+assert_provision_accepts() { # <scenario> <function-name> <message-fragment> <description>
+  local scenario=$1 function_name=$2 needle=$3 desc=$4 out rc
+  out=$(run_provision_test "$scenario" "$function_name" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -qF 'unexpected aws call'; then
+    if [ -z "$needle" ] || printf '%s' "$out" | grep -qF -- "$needle"; then
+      pass "$desc"
+      return
+    fi
+  fi
+  fail "$desc" "exit=$rc, output: ${out:-<none>}"
+}
+
 # ---------------------------------------------------------------------------
 slice_1() { # index.html — the static page, verifiable locally
   echo "--- Slice 1: the static page (index.html) ---"
@@ -255,6 +356,30 @@ slice_3() { # provision.sh — correct on paper, no AWS access needed
   # at Namecheap and hangs ACM validation for 72 hours with no useful error.
   assert_strip '_abc123.fuckingshipit.com.' '_abc123' 'strip_acm_name: apex validation name (trailing dot) -> _abc123'
   assert_strip '_def456.www.fuckingshipit.com.' '_def456.www' 'strip_acm_name: www validation name (trailing dot) -> _def456.www'
+
+  assert_provision_rejects bucket_wrong_region ensure_bucket \
+    "bucket fuckingshipit-com is in 'us-west-2', expected 'us-east-1'" \
+    'ensure_bucket rejects a reused bucket in the wrong region'
+  assert_provision_accepts bucket_healthy ensure_bucket 'already exists — reusing' \
+    'ensure_bucket accepts a reused bucket in the configured region'
+
+  assert_provision_rejects oac_wrong_signing ensure_oac \
+    "SigningBehavior is 'never', expected 'always'" \
+    'ensure_oac rejects a reused OAC that no longer signs requests'
+  assert_provision_accepts oac_healthy ensure_oac 'Reusing origin access control' \
+    'ensure_oac accepts a compatible reused OAC'
+
+  assert_provision_rejects distribution_disabled verify_distribution_settings \
+    "Enabled is 'DISABLED', expected 'ENABLED'" \
+    'distribution drift check rejects a disabled distribution'
+  assert_provision_rejects distribution_wrong_origin verify_distribution_settings \
+    "OriginDomainName is 'other-bucket.s3.us-east-1.amazonaws.com'" \
+    'distribution drift check rejects a repointed origin'
+  assert_provision_rejects distribution_wrong_target verify_distribution_settings \
+    "TargetOriginId is 'other-origin'" \
+    'distribution drift check rejects a repointed default behavior'
+  assert_provision_accepts distribution_healthy verify_distribution_settings '' \
+    'distribution drift check accepts the expected serving path'
 }
 
 # ---------------------------------------------------------------------------

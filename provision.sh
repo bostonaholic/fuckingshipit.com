@@ -41,9 +41,21 @@ require_auth() {
   fi
 }
 
+verify_bucket_region() {
+  local bucket_region
+  bucket_region=$(aws s3api get-bucket-location --bucket "$BUCKET" \
+    --query "not_null(LocationConstraint, 'us-east-1')" --output text)
+  if [ "$bucket_region" != "$REGION" ]; then
+    echo "ERROR: bucket ${BUCKET} is in '${bucket_region}', expected '${REGION}'." >&2
+    echo "Use a bucket in ${REGION} or change BUCKET; an S3 bucket cannot be moved between regions." >&2
+    exit 1
+  fi
+}
+
 ensure_bucket() {
   local err
   if err=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
+    verify_bucket_region
     echo "Bucket ${BUCKET} already exists — reusing."
   elif [[ "$err" == *"403"* ]]; then
     echo "ERROR: head-bucket returned 403 for ${BUCKET}." >&2
@@ -162,6 +174,7 @@ ensure_oac() {
     --query "OriginAccessControlList.Items[?Name=='${OAC_NAME}'] | [0].Id" \
     --output text)
   if [ -n "$OAC_ID" ] && [ "$OAC_ID" != "None" ]; then
+    verify_oac_settings
     echo "Reusing origin access control ${OAC_NAME} (${OAC_ID})."
     return
   fi
@@ -183,6 +196,25 @@ managed_response_headers_policy_id() {
   printf '%s\n' "$id"
 }
 
+require_oac_setting() { # <setting-name> <live-value> <expected-value>
+  if [ "$2" != "$3" ]; then
+    echo "ERROR: origin access control ${OAC_NAME} (${OAC_ID}) has drifted: ${1} is '${2}', expected '${3}'." >&2
+    echo "Fix it in the CloudFront console and re-run — this script does not auto-repair a reused OAC." >&2
+    exit 1
+  fi
+}
+
+verify_oac_settings() {
+  local live origin_type signing_behavior signing_protocol
+  live=$(aws cloudfront get-origin-access-control --id "$OAC_ID" \
+    --query 'OriginAccessControl.OriginAccessControlConfig.[OriginAccessControlOriginType,SigningBehavior,SigningProtocol]' \
+    --output text)
+  read -r origin_type signing_behavior signing_protocol <<<"$live"
+  require_oac_setting OriginAccessControlOriginType "$origin_type" s3
+  require_oac_setting SigningBehavior "$signing_behavior" always
+  require_oac_setting SigningProtocol "$signing_protocol" sigv4
+}
+
 require_setting() { # <setting-name> <live-value> <expected-value>
   if [ "$2" != "$3" ]; then
     echo "ERROR: distribution ${DISTRIBUTION_ID} has drifted: ${1} is '${2}', expected '${3}'." >&2
@@ -191,11 +223,11 @@ require_setting() { # <setting-name> <live-value> <expected-value>
   fi
 }
 
-# Drift check for the reuse path. The TLS, certificate, alias, origin,
-# and security-header settings are only ever WRITTEN by the create
-# branch, so a distribution edited in the console — back to TLSv1, a
-# swapped certificate, a repointed origin, or with the headers policy
-# detached — would otherwise survive every re-run silently. Fail loud,
+# Drift check for the reuse path. Availability, the root object, TLS,
+# certificate, aliases, origin path, and security-header settings are only
+# ever WRITTEN by the create branch, so a distribution edited in the console
+# — disabled, back to TLSv1, repointed at another bucket, or with the headers
+# policy detached — would otherwise survive every re-run silently. Fail loud,
 # naming the drifted setting; an unexpected live config deserves a human
 # decision, not a blind overwrite.
 #
@@ -206,19 +238,27 @@ require_setting() { # <setting-name> <live-value> <expected-value>
 # and joined server-side so ordering can never cause a false failure;
 # the expected string is already in sorted order (DOMAIN < WWW).
 verify_distribution_settings() {
-  local expected_headers_id live viewer_policy min_protocol ssl_method headers_id cert_arn aliases oac_id
+  local expected_headers_id live enabled root_object viewer_policy min_protocol ssl_method
+  local headers_id cert_arn aliases origin_count origin_id origin_domain oac_id target_origin_id
   expected_headers_id=$(managed_response_headers_policy_id)
   live=$(aws cloudfront get-distribution-config --id "$DISTRIBUTION_ID" \
-    --query "DistributionConfig.[DefaultCacheBehavior.ViewerProtocolPolicy, ViewerCertificate.MinimumProtocolVersion, ViewerCertificate.SSLSupportMethod, not_null(DefaultCacheBehavior.ResponseHeadersPolicyId, 'DETACHED'), ViewerCertificate.ACMCertificateArn || 'MISSING', join(',', sort(not_null(Aliases.Items, \`[]\`))) || 'NONE', Origins.Items[0].OriginAccessControlId || 'DETACHED']" \
+    --query "DistributionConfig.[Enabled && 'ENABLED' || 'DISABLED', DefaultRootObject || 'MISSING', DefaultCacheBehavior.ViewerProtocolPolicy, ViewerCertificate.MinimumProtocolVersion, ViewerCertificate.SSLSupportMethod, not_null(DefaultCacheBehavior.ResponseHeadersPolicyId, 'DETACHED'), ViewerCertificate.ACMCertificateArn || 'MISSING', join(',', sort(not_null(Aliases.Items, \`[]\`))) || 'NONE', length(not_null(Origins.Items, \`[]\`)), Origins.Items[0].Id || 'MISSING', Origins.Items[0].DomainName || 'MISSING', Origins.Items[0].OriginAccessControlId || 'DETACHED', DefaultCacheBehavior.TargetOriginId || 'MISSING']" \
     --output text)
-  read -r viewer_policy min_protocol ssl_method headers_id cert_arn aliases oac_id <<<"$live"
+  read -r enabled root_object viewer_policy min_protocol ssl_method headers_id cert_arn aliases \
+    origin_count origin_id origin_domain oac_id target_origin_id <<<"$live"
+  require_setting Enabled "$enabled" ENABLED
+  require_setting DefaultRootObject "$root_object" index.html
   require_setting ViewerProtocolPolicy "$viewer_policy" redirect-to-https
   require_setting MinimumProtocolVersion "$min_protocol" TLSv1.2_2021
   require_setting SSLSupportMethod "$ssl_method" sni-only
   require_setting ResponseHeadersPolicyId "$headers_id" "$expected_headers_id"
   require_setting ACMCertificateArn "$cert_arn" "$CERT_ARN"
   require_setting Aliases "$aliases" "${DOMAIN},${WWW}"
+  require_setting OriginCount "$origin_count" 1
+  require_setting OriginId "$origin_id" "$ORIGIN_ID"
+  require_setting OriginDomainName "$origin_domain" "${BUCKET}.s3.${REGION}.amazonaws.com"
   require_setting OriginAccessControlId "$oac_id" "$OAC_ID"
+  require_setting TargetOriginId "$target_origin_id" "$ORIGIN_ID"
 }
 
 # Lookup by alias BEFORE any create — aliases are globally unique. The
