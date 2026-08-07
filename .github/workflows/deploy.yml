@@ -1,0 +1,78 @@
+# Continuous deployment. A push to master runs the repo's own acceptance
+# gate, then the same ./deploy.sh a human would run by hand.
+name: deploy
+
+on:
+  push:
+    branches: [master]
+  # Manual redeploy without an empty commit. Dispatching from master
+  # produces the same OIDC subject claim, so the role's trust policy
+  # already covers it.
+  workflow_dispatch:
+
+# One deploy at a time, and never cancel one mid-flight: deploy.sh's
+# upload and cache invalidation are two calls that must stay paired.
+concurrency:
+  group: deploy-master
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # tidy — check.sh skips its HTML validity assertion without it, so
+      # installing it turns on a test the repo already wrote.
+      # jq — check.sh's provisioning stubs parse JSON through it; without
+      # it 28 assertions fail. Both ship on the runner image today. Named
+      # anyway, so the gate states its dependencies instead of inheriting
+      # them from whatever GitHub happens to preinstall.
+      - name: Install the gate's dependencies
+        run: sudo apt-get update && sudo apt-get install -y tidy jq
+
+      # shellcheck is preinstalled on the runner image.
+      - name: Lint the shell scripts
+        run: shellcheck provision.sh provision-ci.sh deploy.sh check.sh
+
+      - name: Run the acceptance gate
+        run: ./check.sh
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Only this job gets an identity token; the check job has no way to
+      # reach AWS.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # deploy.env is gitignored, so CI writes the one deploy.sh expects
+      # rather than duplicating its aws commands here. The format is a
+      # contract deploy.sh enforces: exactly these three keys, one per
+      # line, no comments or quotes. The :? guards name the missing secret
+      # instead of letting deploy.sh report a generic parse error.
+      - name: Write deploy.env
+        env:
+          BUCKET: ${{ secrets.DEPLOY_BUCKET }}
+          DISTRIBUTION_ID: ${{ secrets.DEPLOY_DISTRIBUTION_ID }}
+          DISTRIBUTION_DOMAIN: ${{ secrets.DEPLOY_DISTRIBUTION_DOMAIN }}
+        run: |
+          : "${BUCKET:?missing repository secret DEPLOY_BUCKET}"
+          : "${DISTRIBUTION_ID:?missing repository secret DEPLOY_DISTRIBUTION_ID}"
+          : "${DISTRIBUTION_DOMAIN:?missing repository secret DEPLOY_DISTRIBUTION_DOMAIN}"
+          printf 'BUCKET=%s\nDISTRIBUTION_ID=%s\nDISTRIBUTION_DOMAIN=%s\n' \
+            "$BUCKET" "$DISTRIBUTION_ID" "$DISTRIBUTION_DOMAIN" > deploy.env
+
+      - name: Deploy
+        run: ./deploy.sh

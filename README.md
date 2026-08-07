@@ -8,7 +8,11 @@ server, no runtime, nothing to patch. The repo's files:
 - `index.html` — the whole site, CSS inline, zero external requests
 - `check.sh` — pre-deploy grep assertions against `index.html`
 - `provision.sh` — one-time AWS setup (bucket, ACM cert, CloudFront)
+- `provision-ci.sh` — one-time AWS setup for CI (GitHub OIDC provider and
+  the IAM role GitHub Actions assumes)
 - `deploy.sh` — repeatable upload + edge cache invalidation
+- `.github/workflows/deploy.yml` — runs `check.sh` then `deploy.sh` on
+  every push to `master`
 - `deploy.env` — IDs written by `provision.sh` (appears after the first
   provision run), read by `deploy.sh`. Must stay exactly the three plain
   `KEY=value` lines `provision.sh` writes — no comments, no quotes, no
@@ -71,6 +75,37 @@ server, no runtime, nothing to patch. The repo's files:
    `curl -sI https://fuckingshipit.com/` and
    `curl -sI https://www.fuckingshipit.com/` both return `200`.
 
+## Continuous deployment
+
+Every push to `master` runs `check.sh` and then `deploy.sh` — the same two
+commands as by hand, on GitHub's runner instead of a laptop. No AWS keys
+are stored anywhere: the workflow exchanges a short-lived GitHub OIDC
+token for an IAM role that may do exactly two things, upload
+`index.html` and invalidate the cache.
+
+One-time setup, after `provision.sh` has created the distribution:
+
+1. `./provision-ci.sh` — creates the OIDC provider, the role, and its
+   inline policy, then prints the four `gh secret set` commands with the
+   real values filled in. Rerunnable; it rewrites both policies each time,
+   so console drift is corrected rather than inherited.
+2. Run those four commands. The workflow reads `AWS_DEPLOY_ROLE_ARN`,
+   `DEPLOY_BUCKET`, `DEPLOY_DISTRIBUTION_ID`, and
+   `DEPLOY_DISTRIBUTION_DOMAIN`. They are repository *secrets*, not
+   variables, for the same reason `deploy.env` is gitignored — the repo is
+   public and internal resource ids need not be published. One visible
+   effect: Actions masks them, so the deploy log ends
+   `Deployed. Site: https://***/`.
+
+The role's trust policy names the org, the repo, **and** `refs/heads/master`,
+so a fork or a feature branch cannot assume it. The permission to upload is
+scoped to the single key `index.html`; if the site ever grows assets, widen
+`SITE_KEY` in `provision-ci.sh` and re-run it.
+
+Running `./deploy.sh` by hand still works and remains the break-glass path
+when Actions is down. `Actions → deploy → Run workflow` redeploys `master`
+without an empty commit.
+
 ## DNS table
 
 `./provision.sh` prints the real values — these rows are placeholders.
@@ -86,7 +121,8 @@ server, no runtime, nothing to patch. The repo's files:
 
 Pre-deploy:
 
-- `./check.sh` exits 0.
+- `./check.sh` exits 0. CI runs this too, and blocks the deploy if it
+  fails, so a red gate never reaches S3.
 
 Post-deploy, against `$DISTRIBUTION_DOMAIN` — run `source deploy.env` in
 the repo root first, or the curls below hit an empty hostname:

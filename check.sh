@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./check.sh        run every slice's assertions (the full acceptance gate)
-#   ./check.sh 1      run one slice's assertions in isolation (1, 2, 3, or 4)
+#   ./check.sh 1      run one slice's assertions in isolation (1 through 5)
 #
 # Each assertion prints exactly one PASS/FAIL line. Failures carry the
 # reason in parentheses. Exit 0 only when every assertion passes.
@@ -628,19 +628,75 @@ slice_4() { # deploy.sh — refuses to run without deploy.env
 }
 
 # ---------------------------------------------------------------------------
+slice_5() { # continuous deployment — the workflow and the role it assumes
+  echo "--- Slice 5: continuous deployment ---"
+
+  if [ -f provision-ci.sh ] && bash -n provision-ci.sh 2>/dev/null; then
+    pass 'provision-ci.sh parses (bash -n)'
+  else
+    fail 'provision-ci.sh parses (bash -n)' 'provision-ci.sh missing or has syntax errors'
+  fi
+
+  # Same guard, same reason as provision.sh: sourcing must define functions
+  # and reach no AWS call, or this assertion would need credentials to pass.
+  if bash -c 'source ./provision-ci.sh' >/dev/null 2>&1; then
+    pass 'provision-ci.sh is sourceable without executing main (BASH_SOURCE guard)'
+  else
+    fail 'provision-ci.sh is sourceable without executing main (BASH_SOURCE guard)' 'provision-ci.sh missing, or sourcing it runs main'
+  fi
+
+  local wf=.github/workflows/deploy.yml
+  assert_present "$wf" 'branches: [master]' 'the workflow triggers on pushes to master'
+  assert_present "$wf" 'id-token: write' 'the deploy job requests an OIDC identity token'
+  assert_present "$wf" './check.sh' 'the workflow runs this acceptance gate before deploying'
+  assert_present "$wf" './deploy.sh' 'the workflow deploys via deploy.sh, not its own aws commands'
+
+  # jq is preinstalled on the runner, so omitting it would still pass —
+  # until the day it does not, and 28 assertions fail for a reason no one
+  # would look for in a workflow file. The gate names what it needs.
+  assert_present "$wf" 'install -y tidy jq' 'the workflow installs the tools check.sh needs (tidy, jq)'
+
+  # OIDC exists so a public repo never holds a long-lived key. A workflow
+  # that reintroduced one would still deploy — green, and a regression.
+  assert_absent "$wf" 'aws-access-key-id' 'the workflow uses no long-lived AWS access key'
+
+  # deploy.env is gitignored, so CI generates it from secrets. That
+  # generated file must satisfy the same contract slice 4 enforces on a
+  # committed one: a malformed one fails the deploy AFTER this gate has
+  # already gone green. The literal below is asserted to be the workflow's
+  # own format string, then rendered and validated — so a drifted workflow
+  # fails the first assertion and a wrong format fails the second.
+  local fmt='BUCKET=%s\nDISTRIBUTION_ID=%s\nDISTRIBUTION_DOMAIN=%s\n'
+  assert_present "$wf" "printf '$fmt'" 'the workflow writes deploy.env with the expected format string'
+
+  local problems
+  # shellcheck disable=SC2059
+  # $fmt IS the format string under test — the whole point is to render
+  # the workflow's own template, not to print it literally.
+  problems=$(printf "$fmt" sample-bucket E1SAMPLE d1sample.cloudfront.net | deploy_env_violations)
+  if [ -z "$problems" ]; then
+    pass 'the deploy.env that format produces satisfies deploy.sh contract'
+  else
+    fail 'the deploy.env that format produces satisfies deploy.sh contract' "${problems%; }"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 case "${1:-all}" in
   1) slice_1 ;;
   2) slice_2 ;;
   3) slice_3 ;;
   4) slice_4 ;;
+  5) slice_5 ;;
   all)
     slice_1
     slice_2
     slice_3
     slice_4
+    slice_5
     ;;
   *)
-    echo "usage: ./check.sh [1|2|3|4]" >&2
+    echo "usage: ./check.sh [1|2|3|4|5]" >&2
     exit 2
     ;;
 esac
