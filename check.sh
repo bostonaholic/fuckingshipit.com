@@ -329,17 +329,36 @@ slice_1() { # index.html — the static page, verifiable locally
   # whole file, so it cannot tell a tag sitting in <head> from one pasted
   # into <body>; head membership is what crawlers require, which is why the
   # order check follows. That order check pins og:title and nothing else —
-  # the other four ride along because the five ship as one contiguous block
+  # the other tags ride along because they ship as one contiguous block
   # a reviewer reads in a single hunk, not because anything here proves
-  # where they sit. There is no og:image assertion because no image ships:
-  # hosting one needs a wider SITE_KEY on the deploy role and a second
-  # upload.
+  # where they sit.
   assert_present "$HTML" '<meta property="og:title" content="fucking ship it">' 'index.html has the og:title meta'
   assert_present "$HTML" '<meta property="og:type" content="website">' 'index.html has the og:type meta'
   assert_present "$HTML" '<meta property="og:url" content="https://fuckingshipit.com/">' 'index.html has the og:url meta'
   assert_present "$HTML" '<meta property="og:description" content="fucking ship it">' 'index.html has the og:description meta'
+  assert_present "$HTML" '<meta property="og:image" content="https://fuckingshipit.com/og-image.png">' 'index.html has the og:image meta'
   assert_present "$HTML" '<meta name="twitter:card" content="summary">' 'index.html has the twitter:card meta'
+  assert_present "$HTML" '<meta name="twitter:image" content="https://fuckingshipit.com/og-image.png">' 'index.html has the twitter:image meta'
   assert_order "$HTML" '<meta property="og:title" content="fucking ship it">' '</head>' 'og:title sits inside <head>, where crawlers read it'
+
+  # The keys the tags (and browsers) fetch must exist in the repo and be
+  # uploaded by deploy.sh — an og:image pointing at a key nobody uploads
+  # renders as a broken preview only after deploy, where no gate sees it.
+  # The favicon has no tag on the page: browsers request /favicon.ico on
+  # their own, so the file plus its upload is the whole feature, and the
+  # <link>-free page keeps the no-external-references guards below intact.
+  if [ -s og-image.png ]; then
+    pass 'og-image.png exists and is non-empty'
+  else
+    fail 'og-image.png exists and is non-empty' 'missing or empty file'
+  fi
+  if [ -s favicon.ico ]; then
+    pass 'favicon.ico exists and is non-empty'
+  else
+    fail 'favicon.ico exists and is non-empty' 'missing or empty file'
+  fi
+  assert_present deploy.sh 'og-image.png' 'deploy.sh uploads og-image.png'
+  assert_present deploy.sh 'favicon.ico' 'deploy.sh uploads favicon.ico'
 
   # Regression guard for the original layout.haml defect: <body> was nested
   # inside <head>. The fix is well-formed nesting — head closes before body.
