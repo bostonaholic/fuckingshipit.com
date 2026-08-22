@@ -141,6 +141,10 @@ the repo root first, or the curls below hit an empty hostname:
   attached.
 - `curl -s "https://fuckingshipit-com.s3.us-east-1.amazonaws.com/index.html"`
   returns `AccessDenied` (the bucket is private; only CloudFront reads it).
+- `curl -s "https://$DISTRIBUTION_DOMAIN/" | grep -q 'og:title'` matches.
+  Grepping one of the five link-preview tags is deliberate, not an
+  oversight: all five ship inside the same `index.html` object, so one hit
+  proves the whole block landed. `./check.sh` is what pins each tag.
 
 Manual only:
 
@@ -150,3 +154,11 @@ Manual only:
   tag makes phones report their real width, so the `max-width: 600px`
   rule applies.
 - Apex and `www` over HTTPS after the DNS edits propagate.
+- Link previews: paste `https://fuckingshipit.com/` into Slack, an X
+  compose box, and Facebook's Sharing Debugger. Expect a text card reading
+  `fucking ship it`. A text-only card with no image is the pass — the site
+  ships no `og:image`, so the debugger's warning about the missing image is
+  a recorded choice, not a failure. Each platform caches what it scraped:
+  the Sharing Debugger has a "Scrape Again" button, while Slack and X offer
+  no such control, so paste a cache-busting `https://fuckingshipit.com/?1`
+  to force a fresh fetch.
