@@ -17,10 +17,11 @@ set -euo pipefail
 
 DOMAIN=fuckingshipit.com
 BUCKET=fuckingshipit-com
-# The only object deploy.sh ever uploads. Widen to /* if the site grows
-# assets — a PutObject denial surfaces as a failed CI run, not a partial
-# deploy, but it is still an outage of the pipeline.
-SITE_KEY=index.html
+# Exactly the objects deploy.sh uploads, and nothing else. Growing an
+# asset means adding its key here and a cp in deploy.sh, then re-running
+# this script — a PutObject denial surfaces as a failed CI run, not a
+# partial deploy, but it is still an outage of the pipeline.
+SITE_KEYS=(index.html og-image.png favicon.ico)
 GITHUB_ORG=bostonaholic
 GITHUB_REPO=fuckingshipit.com
 BRANCH=master
@@ -109,12 +110,16 @@ EOF
   ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text)
 }
 
-# Exactly what deploy.sh does, nothing more: one PutObject on one key, one
-# invalidation on one distribution. sts:GetCallerIdentity (deploy.sh's
-# session check) needs no permission — every principal may call it.
-# Inline rather than managed so the permissions cannot outlive the role.
+# Exactly what deploy.sh does, nothing more: PutObject on exactly the
+# keys deploy.sh uploads, one invalidation on one distribution.
+# sts:GetCallerIdentity (deploy.sh's session check) needs no permission —
+# every principal may call it. Inline rather than managed so the
+# permissions cannot outlive the role.
 attach_deploy_policy() {
-  local policy
+  local policy key key_arns=""
+  for key in "${SITE_KEYS[@]}"; do
+    key_arns="${key_arns:+${key_arns}, }\"arn:aws:s3:::${BUCKET}/${key}\""
+  done
   policy=$(cat <<EOF
 {
   "Version": "2012-10-17",
@@ -123,7 +128,7 @@ attach_deploy_policy() {
       "Sid": "PutSiteObject",
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::${BUCKET}/${SITE_KEY}"
+      "Resource": [${key_arns}]
     },
     {
       "Sid": "InvalidateEdgeCache",
@@ -137,7 +142,7 @@ EOF
 )
   aws iam put-role-policy --role-name "$ROLE_NAME" \
     --policy-name "$POLICY_NAME" --policy-document "$policy"
-  echo "Wrote inline policy ${POLICY_NAME} (PutObject on ${SITE_KEY}, CreateInvalidation on ${DISTRIBUTION_ID})."
+  echo "Wrote inline policy ${POLICY_NAME} (PutObject on ${SITE_KEYS[*]}, CreateInvalidation on ${DISTRIBUTION_ID})."
 }
 
 # The IDs are not secret, but there is no reason to publish internal

@@ -48,6 +48,16 @@ if ! aws sts get-caller-identity >/dev/null 2>&1; then
   exit 1
 fi
 
+# Assets upload before the page, so index.html never references a key
+# that is not in the bucket yet.
+aws s3 cp og-image.png "s3://${BUCKET}/og-image.png" \
+  --cache-control "public, max-age=300" \
+  --content-type "image/png"
+
+aws s3 cp favicon.ico "s3://${BUCKET}/favicon.ico" \
+  --cache-control "public, max-age=300" \
+  --content-type "image/x-icon"
+
 aws s3 cp index.html "s3://${BUCKET}/index.html" \
   --cache-control "public, max-age=300" \
   --content-type "text/html; charset=utf-8"

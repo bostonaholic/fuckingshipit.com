@@ -6,6 +6,11 @@ One static page served from a private S3 bucket behind CloudFront. No
 server, no runtime, nothing to patch. The repo's files:
 
 - `index.html` — the whole site, CSS inline, zero external requests
+- `og-image.png` — the 🚀 link-preview card image (`og:image` /
+  `twitter:image`), 1200x630, rendered from the system rocket emoji
+- `favicon.ico` — the 🚀 browser-tab icon. Served from the well-known
+  `/favicon.ico` path browsers request on their own, so the page needs no
+  `<link>` tag and keeps its zero-markup-references guarantee
 - `check.sh` — pre-deploy grep assertions against `index.html`
 - `provision.sh` — one-time AWS setup (bucket, ACM cert, CloudFront)
 - `provision-ci.sh` — one-time AWS setup for CI (GitHub OIDC provider and
@@ -99,8 +104,11 @@ One-time setup, after `provision.sh` has created the distribution:
 
 The role's trust policy names the org, the repo, **and** `refs/heads/master`,
 so a fork or a feature branch cannot assume it. The permission to upload is
-scoped to the single key `index.html`; if the site ever grows assets, widen
-`SITE_KEY` in `provision-ci.sh` and re-run it.
+scoped to exactly the keys `deploy.sh` uploads (`index.html`,
+`og-image.png`, `favicon.ico`); when the site grows an asset, add its key
+to `SITE_KEYS` in `provision-ci.sh` and re-run it **before** merging the
+asset — the policy must widen first, or the CI deploy fails with
+`AccessDenied` on the new key.
 
 Running `./deploy.sh` by hand still works and remains the break-glass path
 when Actions is down. `Actions → deploy → Run workflow` redeploys `master`
@@ -142,9 +150,13 @@ the repo root first, or the curls below hit an empty hostname:
 - `curl -s "https://fuckingshipit-com.s3.us-east-1.amazonaws.com/index.html"`
   returns `AccessDenied` (the bucket is private; only CloudFront reads it).
 - `curl -s "https://$DISTRIBUTION_DOMAIN/" | grep -q 'og:title'` matches.
-  Grepping one of the five link-preview tags is deliberate, not an
-  oversight: all five ship inside the same `index.html` object, so one hit
+  Grepping one of the link-preview tags is deliberate, not an
+  oversight: they all ship inside the same `index.html` object, so one hit
   proves the whole block landed. `./check.sh` is what pins each tag.
+- `curl -s -o /dev/null -w "%{http_code} %{content_type}" "https://$DISTRIBUTION_DOMAIN/og-image.png"`
+  returns `200 image/png` — the key `og:image` points at is really there.
+- `curl -s -o /dev/null -w "%{http_code}" "https://$DISTRIBUTION_DOMAIN/favicon.ico"`
+  returns `200`.
 
 Manual only:
 
@@ -155,10 +167,10 @@ Manual only:
   rule applies.
 - Apex and `www` over HTTPS after the DNS edits propagate.
 - Link previews: paste `https://fuckingshipit.com/` into Slack, an X
-  compose box, and Facebook's Sharing Debugger. Expect a text card reading
-  `fucking ship it`. A text-only card with no image is the pass — the site
-  ships no `og:image`, so the debugger's warning about the missing image is
-  a recorded choice, not a failure. Each platform caches what it scraped:
-  the Sharing Debugger has a "Scrape Again" button, while Slack and X offer
-  no such control, so paste a cache-busting `https://fuckingshipit.com/?1`
-  to force a fresh fetch.
+  compose box, and Facebook's Sharing Debugger. Expect a card reading
+  `fucking ship it` with the 🚀 image. Each platform caches what it
+  scraped: the Sharing Debugger has a "Scrape Again" button, while Slack
+  and X offer no such control, so paste a cache-busting
+  `https://fuckingshipit.com/?1` to force a fresh fetch.
+- The browser tab shows the 🚀 favicon (browsers cache favicons hard — a
+  private window is the quickest clean check).
